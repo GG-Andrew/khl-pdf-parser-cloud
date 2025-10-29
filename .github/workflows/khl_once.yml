@@ -1,4 +1,4 @@
-name: KHL ONE — make 897694.json
+name: khl_once
 
 on:
   workflow_dispatch: {}
