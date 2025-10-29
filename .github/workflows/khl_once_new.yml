@@ -41,61 +41,32 @@ jobs:
             -o /tmp/game.pdf "$PDF_URL"
 
           python - <<'PY'
-          import re, json, pathlib, fitz, os, unicodedata
+          import re, fitz, pathlib
 
-UID = int(os.environ["UID"])
-OUT_DIR = os.environ["OUT_DIR"]
-
-def strip_accents(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-
-# читаем PDF
+# читаем PDF из /tmp
 pdf_bytes = pathlib.Path("/tmp/game.pdf").read_bytes()
 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-full_text = "\n".join(p.get_text("text") for p in doc)
+
+# соберём постранично текст (и покажем разными режимами извлечения)
+texts = []
+for i, page in enumerate(doc):
+    t1 = page.get_text("text")
+    t2 = page.get_text("blocks")
+    print(f"\n===== PAGE {i+1} :: get_text('text') =====\n{t1}\n")
+    print(f"===== PAGE {i+1} :: get_text('blocks') =====\n{t2}\n")
+    texts.append(t1)
 doc.close()
 
-# нормализуем
-full_text_norm = strip_accents(full_text).replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
-full_text_norm = re.sub(r"[ \t]+"," ", full_text_norm)
-lines = [l.strip() for l in full_text_norm.splitlines()]
+full = "\n".join(texts)
+lines = [re.sub(r"[ \t]+"," ", x).strip() for x in full.splitlines() if x.strip()]
 
-# === Диагностика: сохраняем сырой текст ===
-raw_dir = pathlib.Path(OUT_DIR).parent / "raw"  # public/khl/raw
-raw_dir.mkdir(parents=True, exist_ok=True)
+print("\n===== HEAD 80 LINES =====")
+for i, l in enumerate(lines[:80], 1):
+    print(f"{i:03d}: {l}")
 
-(pathlib.Path(OUT_DIR) / f"{UID}.json").parent.mkdir(parents=True, exist_ok=True)
-
-# полный текст (много строк)
-(pathlib.Path(raw_dir) / f"{UID}_full.txt").write_text(full_text_norm, encoding="utf-8")
-
-# хвост для быстрого просмотра (последние 150 строк)
-tail = "\n".join(lines[-150:])
-(pathlib.Path(raw_dir) / f"{UID}_tail150.txt").write_text(tail, encoding="utf-8")
-
-# временный «пустой» JSON, чтобы страница деплоилась
-out = {
-  "ok": True,
-  "uid": UID,
-  "data": {
-    "teams": [None, None],
-    "date": None,
-    "time_msk": None,
-    "main_referees": [],
-    "linesmen": [],
-    "goalies": {"home": [], "away": []}
-  },
-  "debug": {
-    "lines_total": len(lines),
-    "hints": [
-      f"Открой raw tail: khl/raw/{UID}_tail150.txt",
-      f"Открой raw full: khl/raw/{UID}_full.txt"
-    ]
-  }
-}
-(pathlib.Path(OUT_DIR) / f"{UID}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-print("Wrote diagnostic files.")
-
+print("\n===== TAIL 120 LINES =====")
+for i, l in enumerate(lines[-120:], len(lines)-120+1):
+    print(f"{i:03d}: {l}")
 
 
           PY
