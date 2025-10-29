@@ -74,108 +74,173 @@ jobs:
           mkdir -p public/khl/raw
 
           python - <<'PY'
-          import os, re, json, unicodedata, pathlib
+          import os, re, json, pathlib
+from datetime import datetime
 
-          UID = int(os.environ["UID"])
-          OUT_DIR = os.environ["OUT_DIR"]
+UID = int(os.environ["UID"])
+OUT_DIR = os.environ["OUT_DIR"]
+PUBLIC = pathlib.Path("public")
+RAW_DIR = PUBLIC / "khl" / "raw"
+JSON_DIR = PUBLIC / "khl" / "json"
 
-          raw_path = pathlib.Path("/tmp/game.txt")
-          raw_text = raw_path.read_text(encoding="utf-8", errors="ignore")
-          raw_lines = [ln.rstrip("\n\r") for ln in raw_text.splitlines()]
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+JSON_DIR.mkdir(parents=True, exist_ok=True)
 
-          def strip_acc(s: str) -> str:
-              s = unicodedata.normalize("NFKD", s)
-              return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
 
-          def norm_line(s: str) -> str:
-              s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
-              s = re.sub(r"[ \t]+"," ", s).strip()
-              return strip_acc(s)
+# Сохраним сырой txt для отладки (чтобы не было 404)
+(pathlib.Path(RAW_DIR) / f"{UID}_game.txt").write_text(raw, encoding="utf-8")
 
-          norm_lines = [norm_line(x) for x in raw_lines]
-          full_norm = "\n".join(norm_lines)
+# Нормализация
+def strip_accents(s:str)->str:
+    return (s
+            .replace("\xa0"," ")
+            .replace("\u2009"," ")
+            .replace("\u202f"," ")
+            )
 
-          # date / time
-          m_date = re.search(r"(\d{2})[./-](\d{2})[./-](\d{4})", full_norm)
-          date = f"{m_date.group(1)}.{m_date.group(2)}.{m_date.group(3)}" if m_date else None
-          m_time = re.search(r"(\d{2}:\d{2})\s*MSK", full_norm, re.I)
-          time_msk = m_time.group(1) if m_time else None
+def norm_line(s:str)->str:
+    s = strip_accents(s)
+    s = re.sub(r"[ \t]+"," ", s)
+    return s.strip()
 
-          # teams: строка сразу после "Матч №"
-          teams = [None, None]
-          try:
-              i_match = next(i for i, ln in enumerate(norm_lines) if re.search(r"^Матч\s*№\s*\d+", ln))
-              raw_after = raw_lines[i_match+1] if i_match+1 < len(raw_lines) else ""
-              parts = [p.strip(' "«»') for p in re.split(r"\s{2,}", raw_after) if p.strip()]
-              if len(parts) >= 2:
-                  teams = [parts[0], parts[-1]]
-          except StopIteration:
-              pass
+lines = [norm_line(x) for x in raw.splitlines() if x.strip()]
+full  = "\n".join(lines)
 
-          # referees: ищем маркеры ролей, берём следующую строку
-          main_refs, linesmen = [], []
-          for i, ln in enumerate(norm_lines):
-              if re.search(r"Главный судья.*Линейн\w+ судья", ln, re.I):
-                  if i + 1 < len(raw_lines):
-                      cols = [c.strip() for c in re.split(r"\s{2,}", raw_lines[i+1]) if c.strip()]
-                      if len(cols) >= 4:
-                          main_refs = cols[0:2]
-                          linesmen  = cols[2:4]
-                  break
+# -------- TEAMS --------
+# Словарь допустимых названий (простого вида достаточно)
+KHL_TEAMS = [
+    "АК БАРС", "АВАНГАРД", "АВТОМОБИЛИСТ", "АМУР", "АВТОМОБИЛИСТ ЕКАТЕРИНБУРГ",
+    "БАРЫС", "ВИТЯЗЬ", "ДИНАМО М", "ДИНАМО МИНСК", "ДИНАМО РИГА", "ЙОКЕРИТ",
+    "КУНЬЛУНЬ", "ЛОКОМОТИВ", "МЕТАЛЛУРГ МГ", "НЕФТЕХИМИК", "САЛАВАТ ЮЛАЕВ",
+    "СЕВЕРСТАЛЬ", "СИБИРЬ", "СКА", "СОЧИ", "СПАРТАК МОСКВА", "ТРАКТОР", "ТОРПЕДО", "ЦСКА", "ХК СОЧИ"
+]
 
-          # goalies: блок "Вратари    Вратари", читаем 1-3 строк ниже
-          goal = {"home": [], "away": []}
+def find_teams(lines):
+    # ищем строку с названием двух команд без разделителей, как в примере
+    # возьмём строку около заголовка "№ Поз Фамилия, Имя"
+    cand_idx = None
+    for i,ln in enumerate(lines[:20]):
+        if "№ Поз Фамилия" in ln:
+            cand_idx = max(0, i-1)
+            break
+    if cand_idx is None:
+        # бэкап: ищем строку, где встречается хотя бы одно известное имя команды
+        for i,ln in enumerate(lines[:40]):
+            if sum(1 for t in KHL_TEAMS if t in ln.upper()) >= 1:
+                cand_idx = i
+                break
 
-          def parse_goal_cell(text: str):
-              text = re.sub(r"\s+\d{2}\.\d{2}\.\d{4}\s+\d{1,2}\s*$", "", text)
-              m = re.match(r"\s*(\d{1,2})\s*В\s+(.*)$", text)
-              if not m: return None
-              num = int(m.group(1)); tail = m.group(2).strip()
-              status = ""
-              if re.search(r"\bС\b", tail): status = "starter"; tail = re.sub(r"\bС\b", "", tail)
-              elif re.search(r"\bР\b", tail): status = "reserve"; tail = re.sub(r"\bР\b", "", tail)
-              toks = [t for t in tail.split() if t]
-              name = " ".join(toks[:2]) if len(toks) >= 2 else tail
-              return {"number": num, "name": name, "status": status}
+    if cand_idx is None:
+        return [None, None]
 
-          i_vr = None
-          for i, ln in enumerate(norm_lines):
-              if re.search(r"\bВратари\b\s+\bВратари\b", ln, re.I):
-                  i_vr = i
-                  break
+    txt = lines[cand_idx].upper()
+    # выделим все встречающиеся токены из словаря
+    hits = []
+    for t in KHL_TEAMS:
+        if t in txt:
+            hits.append(t)
+    # оставим уникальные и разумное количество (2)
+    uniq = []
+    for h in hits:
+        if h not in uniq:
+            uniq.append(h)
+    if len(uniq) >= 2:
+        # частые дубли вида "ХК СОЧИ" + "СОЧИ" — уберём короткий дубль
+        cleaned = []
+        for h in uniq:
+            if any(h != x and h in x for x in uniq):
+                continue
+            cleaned.append(h)
+        uniq = cleaned or uniq
+        return [uniq[0].title(), uniq[1].title()]
+    return [None, None]
 
-          if i_vr is not None:
-              for row in raw_lines[i_vr+1 : min(i_vr+4, len(raw_lines))]:
-                  cols = [c for c in re.split(r"\s{2,}", row) if c.strip()]
-                  if len(cols) >= 2:
-                      L = parse_goal_cell(cols[0])
-                      R = parse_goal_cell(cols[-1])
-                      if L: goal["home"].append(L)
-                      if R: goal["away"].append(R)
+teams = find_teams(lines)
 
-          out = {
-              "ok": True,
-              "uid": UID,
-              "data": {
-                  "teams": teams,
-                  "date": date,
-                  "time_msk": time_msk,
-                  "main_referees": main_refs,
-                  "linesmen": linesmen,
-                  "goalies": goal,
-              },
-          }
+# -------- TIME --------
+m_time = re.search(r"Начало\s+матча:\s*(\d{2}:\d{2})", full)
+time_msk = m_time.group(1) if m_time else None
 
-          out_dir = pathlib.Path(OUT_DIR)
-          out_dir.mkdir(parents=True, exist_ok=True)
-          (out_dir / f"{UID}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+# -------- DATE --------
+m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
+if m_upd:
+    date = m_upd.group(1).replace("/",".").replace("-",".")
+else:
+    all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
+    def to_dt(s):
+        s = s.replace("/",".").replace("-",".")
+        try: return datetime.strptime(s, "%d.%m.%Y")
+        except: return None
+    cands = [to_dt(d) for d in all_dates]
+    cands = [d for d in cands if d]
+    date = max(cands).strftime("%d.%m.%Y") if cands else None
 
-          raw_dir = pathlib.Path("public/khl/raw")
-          raw_dir.mkdir(parents=True, exist_ok=True)
-          (raw_dir / f"{UID}_game.txt").write_text(raw_text, encoding="utf-8")
-          (raw_dir / f"{UID}_lines.json").write_text(json.dumps(raw_lines[:200], ensure_ascii=False, indent=2), encoding="utf-8")
+# -------- REFEREES (главные / лайнсмены) --------
+main_referees, linesmen = [], []
+# Берём компактный блок судей: 3–4 строки вокруг фразы "Главный судья"
+for i,ln in enumerate(lines[:150]):
+    if "ГЛАВНЫЙ СУДЬЯ" in ln.upper():
+        window = " ".join(lines[i:i+3])
+        # Имена через пробелы:
+        fio = re.findall(r"[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}", window)
+        # первые 2 считаем главными, остальные лайнсменами
+        main_referees = fio[:2]
+        linesmen     = fio[2:4]
+        break
 
-          print("OK: wrote JSON and RAW dumps")
+# -------- GOALIES --------
+# Берём 3 строки после "Вратари Вратари", разделяем на левую/правую колонку по >=2 пробелов
+goal = {"home":[], "away":[]}
+try:
+    idx = next(i for i,ln in enumerate(lines[:50]) if re.search(r"\bВратари\s+Вратари\b", ln, re.I))
+    goalie_block = lines[idx+1: idx+1+5]  # максимум 4–5 строк
+    def parse_one(side_txt):
+        # формат: "70 В Николаев Дмитрий ... С|Р"
+        m = re.search(r"\b(\d{1,2})\s+В\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+).*?\b(С|Р)\b", side_txt)
+        if not m: 
+            return None
+        num, last, first, stat = m.groups()
+        return {
+            "number": int(num),
+            "name": f"{last} {first}",
+            "status": {"С":"starter","Р":"reserve"}[stat]
+        }
+    for row in goalie_block:
+        parts = re.split(r"\s{2,}", row)
+        if len(parts) >= 2:
+            left, right = parts[0], parts[-1]
+            L = parse_one(left)
+            R = parse_one(right)
+            if L: goal["home"].append(L)
+            if R: goal["away"].append(R)
+except StopIteration:
+    pass
+
+# сохраним распиленные строки для отладки
+(pathlib.Path(RAW_DIR) / f"{UID}_lines.json").write_text(
+    json.dumps(lines, ensure_ascii=False, indent=2),
+    encoding="utf-8"
+)
+
+out = {
+    "ok": True,
+    "uid": UID,
+    "data": {
+        "teams": teams,
+        "date": date,
+        "time_msk": time_msk,
+        "main_referees": main_referees,
+        "linesmen": linesmen,
+        "goalies": goal
+    }
+}
+(pathlib.Path(JSON_DIR) / f"{UID}.json").write_text(
+    json.dumps(out, ensure_ascii=False, indent=2),
+    encoding="utf-8"
+)
+print("Wrote", (JSON_DIR / f"{UID}.json"))
+
           PY
 
       - name: Show TREE of public
