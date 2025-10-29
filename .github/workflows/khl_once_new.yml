@@ -42,58 +42,98 @@ jobs:
 
           python - <<'PY'
           import re, json, pathlib, fitz, os
-          UID = int(os.environ["UID"]); OUT_DIR = os.environ["OUT_DIR"]
-          pdf_bytes = pathlib.Path("/tmp/game.pdf").read_bytes()
-          doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-          full = "\n".join(p.get_text("text") for p in doc); doc.close()
 
-          def norm(t): return re.sub(r"[ \t]+"," ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
+UID = int(os.environ["UID"])
+OUT_DIR = os.environ["OUT_DIR"]
 
-          full = norm(full); lines=[norm(x) for x in full.splitlines() if x.strip()]
+# 1) Читаем PDF
+pdf_bytes = pathlib.Path("/tmp/game.pdf").read_bytes()
+doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+full = "\n".join(p.get_text("text") for p in doc)
+doc.close()
 
-          RE_TEAMS=re.compile(r'^\s*([A-Za-zА-Яа-яЁё ."«»\-]+)\s[–—\-]\s([A-Za-zА-Яа-яЁё ."«»\-]+)\s*$', re.M)
-          RE_DATE=re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4})")
-          RE_TIME=re.compile(r"(\d{2}:\d{2})")
-          RE_REFS=re.compile(r"Главн(?:ые)?\s+судьи?\s*[:\-]?\s*([^\n]+)", re.I)
-          RE_LINS=re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.I)
-          RE_PL  =re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.I)
+def norm(t: str) -> str:
+    return re.sub(r"[ \t]+", " ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
 
-          m=RE_TEAMS.search(full); teams=[m.group(1).strip(' "«»'), m.group(2).strip(' "«»')] if m else [None,None]
-          date=(RE_DATE.search(full).group(1).replace("/",".").replace("-",".")) if RE_DATE.search(full) else None
-          time_msk=(RE_TIME.search(full).group(1)) if RE_TIME.search(full) else None
+full = norm(full)
+lines = [norm(x) for x in full.splitlines() if x.strip()]
+n = len(lines)
 
-          split=lambda s:[x.strip(" .") for x in re.split(r"[;,]", s) if x.strip()]
-          refs=split(RE_REFS.search(full).group(1)) if RE_REFS.search(full) else []
-          lins=split(RE_LINS.search(full).group(1)) if RE_LINS.search(full) else []
+# 2) Команды (две строки после «Матч №…»)
+teams = [None, None]
+try:
+    idx_match = next(i for i,l in enumerate(lines) if "Матч" in l)
+    take = []
+    for l in lines[idx_match+1: idx_match+12]:
+        if re.search(r"№|Поз|Фамилия|Начало|Лет|Д\.Р\.|Составы|ДС|г\.", l): 
+            continue
+        if len(l.strip()) >= 3:
+            take.append(l.strip(' "«»'))
+        if len(take) == 2:
+            break
+    if len(take) == 2:
+        teams = take
+except StopIteration:
+    pass
 
-          goal={"home":[],"away":[]}
-          idxs=[i for i,l in enumerate(lines) if re.search(r"\bВратар[ьи]\b", l, re.I)]
-          blocks=[]
-          for i in idxs:
-              blk=[]
-              for j in range(i+1, min(i+22,len(lines))):
-                  t=lines[j].strip()
-                  if not t or re.match(r"^\w+\s*:", t): break
-                  blk.append(t)
-              blocks.append(blk)
+# 3) Время и дата
+m_time = re.search(r"Начало матча:\s*(\d{2}:\d{2})", full)
+time_msk = m_time.group(1) if m_time else None
 
-          def parse_blk(b):
-              out=[]
-              for l in b:
-                  mm=RE_PL.search(l)
-                  if mm:
-                      num=int(mm.group(1)); last=mm.group(2).title(); first=mm.group(3).title()
-                      stat=(mm.group(4) or mm.group(5) or "").upper()
-                      status={"С":"starter","Р":"reserve"}.get(stat,"")
-                      out.append({"number":num,"name":f"{last} {first}","status":status})
-              return out
+dates = re.findall(r"\b(\d{2}\.\d{2}\.\d{4})\b", full)
+date = dates[-1] if dates else None  # берём последнюю (из «Обновлено»)
 
-          if blocks: goal["home"]=parse_blk(blocks[0])
-          if len(blocks)>1: goal["away"]=parse_blk(blocks[1])
+# 4) Главные/линейные судьи — берём 4 последних «Имя Фамилия» в нижнем блоке
+name_re = re.compile(r'^[А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё\-]+){1,2}$')
+tail_names = [l.strip() for l in lines[-80:] if name_re.match(l.strip())]
+tail_names = list(dict.fromkeys(tail_names))  # уникальные в порядке встречи
+# часто наверху этого блока бывают ещё «старшие»/резервные — берём последние 4
+last4 = tail_names[-4:] if len(tail_names) >= 4 else tail_names
+main_referees = last4[:2]
+linesmen = last4[2:4] if len(last4) >= 4 else []
 
-          out={"ok":True,"uid":UID,"data":{"teams":teams,"date":date,"time_msk":time_msk,"main_referees":refs,"linesmen":lins,"goalies":goal}}
-          p=pathlib.Path(OUT_DIR)/f"{UID}.json"; p.parent.mkdir(parents=True, exist_ok=True)
-          p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"); print("Wrote", p)
+# 5) Вратари: ищем строки «В», следующая — ФИО, дальше (если есть) «С/Р»
+goalies_all = []
+i = 0
+while i < n:
+    if lines[i].strip() == "В":
+        name = lines[i+1].strip() if i+1 < n else ""
+        status = ""
+        if i+2 < n and lines[i+2].strip() in ("С","Р"):
+            status = {"С":"starter", "Р":"reserve"}[lines[i+2].strip()]
+            i += 3
+        else:
+            i += 2
+        goalies_all.append({"idx": i, "name": name, "status": status})
+    else:
+        i += 1
+
+# делим пополам (в PDF две колонки): первая половина — «home», вторая — «away»
+half = len(goalies_all)//2
+goal_home = [{"name": g["name"], "gk_status": g["status"]} for g in goalies_all[:half]]
+goal_away = [{"name": g["name"], "gk_status": g["status"]} for g in goalies_all[half:]]
+
+out = {
+  "ok": True,
+  "uid": UID,
+  "data": {
+    "teams": teams,
+    "date": date,
+    "time_msk": time_msk,
+    "main_referees": main_referees,
+    "linesmen": linesmen,
+    "goalies": {
+      "home": goal_home,
+      "away": goal_away
+    }
+  }
+}
+
+p = pathlib.Path(OUT_DIR) / f"{UID}.json"
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+print("Wrote", p)
+
           PY
 
       - uses: actions/upload-pages-artifact@v3
