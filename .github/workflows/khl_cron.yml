@@ -1,0 +1,185 @@
+name: KHL PDF → JSON (cron)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    env:
+      ICS_URL: "https://khl-cloud-results.pages.dev/khl/const_core/data_khl_25-26.ics"  # <-- поставь свой .ics
+      SEASON: "1369"
+      WINDOW_MIN: "65"   # окно T-60 (+немного)
+      OUT_DIR: "public/khl/json"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System deps (tesseract + poppler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-rus poppler-utils
+
+      - name: Python 3.11 + deps
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Parse ICS → fetch PDFs → make JSON
+        run: |
+          mkdir -p "$OUT_DIR"
+          python - <<'PY'
+          import os, re, json, time, pathlib, asyncio
+          import httpx
+          from datetime import datetime, timedelta, timezone
+          import fitz
+          from pdf2image import convert_from_bytes
+          import pytesseract
+          import numpy as np
+
+          ICS_URL = os.environ["ICS_URL"]
+          SEASON = int(os.environ["SEASON"])
+          WINDOW_MIN = int(os.environ["WINDOW_MIN"])
+          OUT_DIR = os.environ["OUT_DIR"]
+
+          # --- tiny helpers (упрощённый код из main.py) ---
+          def norm_text(t): 
+              return re.sub(r"[ \t]+"," ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
+
+          RE_TEAMS_LINE = re.compile(r'^\s*([A-Za-zА-Яа-яЁё ."«»\-]+)\s[–—\-]\s([A-Za-zА-Яа-яЁё ."«»\-]+)\s*$')
+          RE_DATE = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4})")
+          RE_TIME = re.compile(r"(\d{2}:\d{2})")
+          RE_REFEREES = re.compile(r"Главн(?:ые)?\s+судьи?\s*[:\-]?\s*([^\n]+)", re.IGNORECASE)
+          RE_LINESEM = re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.IGNORECASE)
+          RE_PLAYER = re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.IGNORECASE)
+
+          async def fetch(url):
+              async with httpx.AsyncClient(follow_redirects=True, timeout=30) as c:
+                  r = await c.get(url, headers={"Referer":"https://www.khl.ru/"})
+                  r.raise_for_status()
+                  return r.content
+
+          def parse_ics(ics_bytes):
+              text = ics_bytes.decode("utf-8", "ignore")
+              now = datetime.now(timezone.utc)
+              upcoming = []
+              # грубо извлекаем DTSTART и UID матча (6+ цифр встречается в SUMMARY/UID/URL)
+              for block in text.split("BEGIN:VEVENT"):
+                  if "DTSTART" not in block: 
+                      continue
+                  mdt = re.search(r"DTSTART(?:;[^:\n]+)?:([0-9TZ]+)", block)
+                  if not mdt: 
+                      continue
+                  dt = mdt.group(1)
+                  # поддержка форматов YYYYMMDDTHHMMSSZ / YYYYMMDDTHHMM
+                  if dt.endswith("Z"):
+                      fmt = "%Y%m%dT%H%M%SZ" if len(dt)==16 else "%Y%m%dT%H%M%S%fZ"
+                      dtstart = datetime.strptime(dt, fmt).replace(tzinfo=timezone.utc)
+                  else:
+                      fmt = "%Y%m%dT%H%M%S" if "T" in dt else "%Y%m%d"
+                      dtstart = datetime.strptime(dt, fmt).replace(tzinfo=timezone.utc)
+                  if now <= dtstart <= now + timedelta(minutes=WINDOW_MIN):
+                      m = re.search(r"(\d{6,})", block)
+                      if m:
+                          upcoming.append((int(m.group(1)), dtstart))
+              return upcoming
+
+          def extract_text_mupdf(pdf_bytes):
+              doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+              pages = [p.get_text("text") for p in doc]
+              doc.close()
+              return "\n".join(pages)
+
+          def ocr(pdf_bytes):
+              txts=[]
+              for im in convert_from_bytes(pdf_bytes, dpi=320)[:2]:
+                  txts.append(pytesseract.image_to_string(im, lang="rus+eng"))
+              return "\n".join(txts)
+
+          def parse_text(full_text):
+              full_text = norm_text(full_text)
+              lines = [norm_text(l) for l in full_text.splitlines() if l.strip()]
+              # teams
+              teams=[None,None]
+              for ln in lines[:50]:
+                  mm=RE_TEAMS_LINE.search(ln)
+                  if mm: 
+                      teams=[mm.group(1).strip(' "«»'), mm.group(2).strip(' "«»')]
+                      break
+              # date/time
+              date=time_s=None
+              for ln in lines[:80]:
+                  if date is None:
+                      m=RE_DATE.search(ln);  date=m.group(1).replace("/",".").replace("-",".") if m else None
+                  if time_s is None:
+                      m=RE_TIME.search(ln);  time_s=m.group(1) if m else None
+              # refs / linesmen
+              refs=[]; lins=[]
+              m=RE_REFEREES.search(full_text)
+              if m: refs=[x.strip(" .") for x in re.split(r"[;,]", m.group(1)) if x.strip()]
+              m=RE_LINESEM.search(full_text)
+              if m: lins=[x.strip(" .") for x in re.split(r"[;,]", m.group(1)) if x.strip()]
+              # goalies (два блока после заголовка "Вратари")
+              goalies={"home":[],"away":[]}
+              idxs=[i for i,l in enumerate(lines) if re.search(r"\bВратар[ьи]\b", l, re.IGNORECASE)]
+              blocks=[]
+              for idx in idxs:
+                  blk=[]
+                  for j in range(idx+1, min(idx+22,len(lines))):
+                      t=lines[j].strip()
+                      if not t or re.search(r"^\w+\s*:", t): break
+                      blk.append(t)
+                  blocks.append(blk)
+              def parse_blk(b):
+                  out=[]
+                  for ln in b:
+                      m=RE_PLAYER.search(ln)
+                      if m:
+                          num=int(m.group(1)); last=m.group(2).title(); first=m.group(3).title()
+                          stat=(m.group(4) or m.group(5) or "").upper()
+                          status={"С":"starter","Р":"reserve"}.get(stat,"")
+                          out.append({"number":num,"name":f"{last} {first}","status":status})
+                  return out
+              if blocks: goalies["home"]=parse_blk(blocks[0])
+              if len(blocks)>1: goalies["away"]=parse_blk(blocks[1])
+              return {"teams":teams,"date":date,"time_msk":time_s,"main_referees":refs,"linesmen":lins,"goalies":goalies}
+
+          async def main():
+              ics = await fetch(ICS_URL)
+              upcoming = parse_ics(ics)
+              if not upcoming:
+                  print("No matches in window"); return
+              os.makedirs(OUT_DIR, exist_ok=True)
+              async with httpx.AsyncClient(follow_redirects=True, timeout=30) as c:
+                  for uid,dt in upcoming:
+                      url=f"https://www.khl.ru/pdf/{SEASON}/{uid}/game-{uid}-start-ru.pdf"
+                      r=await c.get(url, headers={"Referer":"https://www.khl.ru/"})
+                      if r.status_code!=200:
+                          print("Skip",uid,"status",r.status_code); continue
+                      txt=extract_text_mupdf(r.content)
+                      weak = len(txt)<500
+                      if weak:
+                          txt = ocr(r.content)
+                      data=parse_text(txt)
+                      out={"ok":True,"uid":uid,"pdf_url":url,"data":data,"ts":int(time.time())}
+                      path=pathlib.Path(OUT_DIR)/f"{uid}.json"
+                      path.parent.mkdir(parents=True, exist_ok=True)
+                      path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+                      print("Wrote", path)
+              print("Done")
+
+          asyncio.run(main())
+          PY
+
+      - name: Publish to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
