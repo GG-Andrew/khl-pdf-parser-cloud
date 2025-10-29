@@ -1,0 +1,112 @@
+name: KHL ONE — make 897694.json
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      UID: "897694"
+      SEASON: "1369"
+      OUT_DIR: "public/khl/json"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 + deps
+        uses: actions/setup-python@v5
+        with:
+            python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Fetch PDF → parse with PyMuPDF → write JSON
+        run: |
+          mkdir -p "$OUT_DIR"
+          python - <<'PY'
+          import os, re, json, pathlib, httpx, fitz
+          UID = int(os.environ["UID"])
+          SEASON = int(os.environ["SEASON"])
+          OUT_DIR = os.environ["OUT_DIR"]
+          PDF = f"https://www.khl.ru/pdf/{SEASON}/{UID}/game-{UID}-start-ru.pdf"
+
+          def norm(t): 
+              return re.sub(r"[ \t]+"," ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
+
+          RE_TEAMS = re.compile(r'^\s*([A-Za-zА-Яа-яЁё ."«»\-]+)\s[–—\-]\s([A-Za-zА-Яа-яЁё ."«»\-]+)\s*$', re.M)
+          RE_DATE  = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4})")
+          RE_TIME  = re.compile(r"(\d{2}:\d{2})")
+          RE_REFS  = re.compile(r"Главн(?:ые)?\s+судьи?\s*[:\-]?\s*([^\n]+)", re.I)
+          RE_LINS  = re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.I)
+          RE_PL    = re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.I)
+
+          with httpx.Client(follow_redirects=True, timeout=30) as c:
+              r = c.get(PDF, headers={"Referer":"https://www.khl.ru/"}); r.raise_for_status()
+              doc = fitz.open(stream=r.content, filetype="pdf")
+              full = "\n".join(p.get_text("text") for p in doc); doc.close()
+
+          full = norm(full)
+          lines = [norm(x) for x in full.splitlines() if x.strip()]
+
+          # teams
+          m = RE_TEAMS.search(full)
+          teams = [m.group(1).strip(' "«»'), m.group(2).strip(' "«»')] if m else [None, None]
+
+          # date/time
+          date = (RE_DATE.search(full).group(1).replace("/",".").replace("-",".")) if RE_DATE.search(full) else None
+          time_msk = (RE_TIME.search(full).group(1)) if RE_TIME.search(full) else None
+
+          # refs / linesmen
+          def split_list(s): 
+              return [x.strip(" .") for x in re.split(r"[;,]", s) if x.strip()]
+          refs = split_list(RE_REFS.search(full).group(1)) if RE_REFS.search(full) else []
+          lins = split_list(RE_LINS.search(full).group(1)) if RE_LINS.search(full) else []
+
+          # goalies (два коротких блока после слова "Вратари")
+          goal={"home":[],"away":[]}
+          idxs=[i for i,l in enumerate(lines) if re.search(r"\bВратар[ьи]\b", l, re.I)]
+          blocks=[]
+          for i in idxs:
+              blk=[]
+              for j in range(i+1, min(i+22, len(lines))):
+                  t=lines[j].strip()
+                  if not t or re.match(r"^\w+\s*:", t): break
+                  blk.append(t)
+              blocks.append(blk)
+          def parse_blk(b):
+              out=[]
+              for l in b:
+                  mm=RE_PL.search(l)
+                  if mm:
+                      num=int(mm.group(1)); last=mm.group(2).title(); first=mm.group(3).title()
+                      stat=(mm.group(4) or mm.group(5) or "").upper()
+                      status={"С":"starter","Р":"reserve"}.get(stat,"")
+                      out.append({"number":num,"name":f"{last} {first}","status":status})
+              return out
+          if blocks: goal["home"]=parse_blk(blocks[0])
+          if len(blocks)>1: goal["away"]=parse_blk(blocks[1])
+
+          out = {"ok": True, "uid": UID, "pdf_url": PDF,
+                 "data": {"teams": teams, "date": date, "time_msk": time_msk,
+                          "main_referees": refs, "linesmen": lins, "goalies": goal}}
+          path = pathlib.Path(OUT_DIR)/f"{UID}.json"
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("Wrote", path)
+          PY
+
+      - name: Upload artifact (public/)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+      - name: Deploy to Pages
+        uses: actions/deploy-pages@v4
