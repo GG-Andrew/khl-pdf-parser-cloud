@@ -41,32 +41,51 @@ jobs:
             -o /tmp/game.pdf "$PDF_URL"
 
           python - <<'PY'
-          import re, fitz, pathlib
+          import re, pathlib, fitz, os, unicodedata, json
 
-# читаем PDF из /tmp
+UID = int(os.environ["UID"])
+OUT_DIR = os.environ["OUT_DIR"]
+
+def norm(s:str)->str:
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
+    return re.sub(r"[ \t]+"," ", s)
+
+# 1) читаем PDF
 pdf_bytes = pathlib.Path("/tmp/game.pdf").read_bytes()
 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-# соберём постранично текст (и покажем разными режимами извлечения)
-texts = []
-for i, page in enumerate(doc):
-    t1 = page.get_text("text")
-    t2 = page.get_text("blocks")
-    print(f"\n===== PAGE {i+1} :: get_text('text') =====\n{t1}\n")
-    print(f"===== PAGE {i+1} :: get_text('blocks') =====\n{t2}\n")
-    texts.append(t1)
+texts=[]
+for i, p in enumerate(doc):
+    t = p.get_text("text")
+    print(f"\n===== PAGE {i+1} :: get_text('text') =====\n{t}\n")
+    texts.append(t)
 doc.close()
 
-full = "\n".join(texts)
-lines = [re.sub(r"[ \t]+"," ", x).strip() for x in full.splitlines() if x.strip()]
+full = norm("\n".join(texts))
+lines = [norm(x).strip() for x in full.splitlines() if x.strip()]
 
-print("\n===== HEAD 80 LINES =====")
-for i, l in enumerate(lines[:80], 1):
-    print(f"{i:03d}: {l}")
+# 2) кладём диагностические файлы в Pages
+raw_dir = pathlib.Path(OUT_DIR).parent / "raw"   # public/khl/raw
+raw_dir.mkdir(parents=True, exist_ok=True)
+(pathlib.Path(raw_dir)/f"{UID}_full.txt").write_text(full, encoding="utf-8")
+(pathlib.Path(raw_dir)/f"{UID}_tail150.txt").write_text("\n".join(lines[-150:]), encoding="utf-8")
 
-print("\n===== TAIL 120 LINES =====")
-for i, l in enumerate(lines[-120:], len(lines)-120+1):
-    print(f"{i:03d}: {l}")
+# 3) временный JSON, чтобы прошёл деплой
+out = {
+  "ok": True,
+  "uid": UID,
+  "data": {"teams":[None,None],"date":None,"time_msk":None,
+           "main_referees":[],"linesmen":[],"goalies":{"home":[],"away":[]}},
+  "debug": {"tail_url": f"khl/raw/{UID}_tail150.txt", "full_url": f"khl/raw/{UID}_full.txt"}
+}
+pathlib.Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+(pathlib.Path(OUT_DIR)/f"{UID}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+
+print("\n===== HEAD 60 =====")
+for i,l in enumerate(lines[:60],1): print(f"{i:03d}: {l}")
+print("\n===== TAIL 120 =====")
+for i,l in enumerate(lines[-120:], len(lines)-120+1): print(f"{i:03d}: {l}")
 
 
           PY
