@@ -1,0 +1,290 @@
+name: KHL ONE — make JSON
+
+on:
+  workflow_dispatch:
+    inputs:
+      UID:
+        description: "UID матча (пример: 897694)"
+        required: true
+        default: "897694"
+      SEASON:
+        description: "Сезон (пример: 1369)"
+        required: true
+        default: "1369"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  OUT_DIR: public/khl/json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set variables
+        run: |
+          echo "UID=${{ github.event.inputs.UID }}" >> $GITHUB_ENV
+          echo "SEASON=${{ github.event.inputs.SEASON }}" >> $GITHUB_ENV
+          echo "OUT_DIR=${{ env.OUT_DIR }}" >> $GITHUB_ENV
+
+      - name: Install pdftotext (poppler-utils) & Python 3.11
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fetch PDF into /tmp
+        run: |
+          set -e
+          PDF_URL="https://khl.ru/pdf/${SEASON}/${UID}/game-${UID}-start-ru.pdf"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          echo "PDF_URL=$PDF_URL"
+          curl -sSL --http2 --fail \
+            -H "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8" \
+            -H "Accept-Language: ru,en;q=0.9" \
+            -H "Referer: https://khl.ru/" \
+            -H "User-Agent: $UA" \
+            -o /tmp/game.pdf "$PDF_URL"
+
+      - name: pdftotext (layout) -> /tmp/game.txt + dump head/tail
+        run: |
+          set -e
+          pdftotext -layout -nopgbrk /tmp/game.pdf /tmp/game.txt
+          echo "===== HEAD 40 ====="
+          nl -ba /tmp/game.txt | sed -n '1,40p'
+          echo "===== TAIL 80 ====="
+          LINES=$(wc -l < /tmp/game.txt); START=$((LINES-79)); if [ $START -lt 1 ]; then START=1; fi
+          nl -ba /tmp/game.txt | sed -n "${START},${LINES}p"
+
+      - name: Save RAW (txt + lines.json) into public/khl/raw
+        run: |
+          set -e
+          mkdir -p public/khl/raw
+          cp /tmp/game.txt "public/khl/raw/${UID}_game.txt"
+          python - <<'PY'
+import json, os, pathlib
+raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
+lines = [x.rstrip() for x in raw.splitlines()]
+out = {"uid": int(os.environ["UID"]), "lines": lines}
+pathlib.Path("public/khl/raw").mkdir(parents=True, exist_ok=True)
+pathlib.Path(f"public/khl/raw/{os.environ['UID']}_lines.json").write_text(
+    json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+print("RAW saved:", f"public/khl/raw/{os.environ['UID']}_game.txt",
+                 f"public/khl/raw/{os.environ['UID']}_lines.json")
+PY
+
+      - name: Parse → JSON
+        run: |
+          set -e
+          python - <<'PY'
+import os, re, json, pathlib, datetime
+
+UID      = int(os.environ["UID"])
+OUT_DIR  = os.environ["OUT_DIR"]
+
+txt = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
+
+def norm(s:str)->str:
+    s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
+    s = re.sub(r"[ \t]+"," ", s)
+    return s.strip()
+
+lines = [norm(x) for x in txt.splitlines() if norm(x)]
+
+# 1) Дата + время (MSK)
+date = None
+time_msk = None
+for ln in lines[:60]:
+    m = re.search(r"(\d{2})[.](\d{2})[.](\d{4})", ln)
+    if m:
+        date = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    if not time_msk:
+        mt = re.search(r"(\d{2}:\d{2})\s*MSK", ln, re.I)
+        if mt: time_msk = mt.group(1)
+if not time_msk:
+    # запасной поиск без "MSK"
+    for ln in lines[:60]:
+        mt = re.search(r"\b(\d{2}:\d{2})\b", ln)
+        if mt: 
+            time_msk = mt.group(1)
+            break
+
+# 2) Команды
+teams = [None, None]
+# Найдём строку, где подряд идут большие "названия" и имеются большие разрывы (двойные и более пробелы)
+candidate_idx = None
+for i, ln in enumerate(lines[:40]):
+    # ищем строку типа "СПАРТАК МОСКВА   ХК СОЧИ  СОЧИ"
+    if re.search(r"[А-ЯA-Z]{2,}", ln) and ("  " in ln):
+        # отфильтруем явные служебные
+        if "№ Поз" in ln or "Вратари" in ln or "Составы" in ln:
+            continue
+        candidate_idx = i
+        break
+
+if candidate_idx is not None:
+    parts = re.split(r"\s{2,}", lines[candidate_idx])
+    # выберем 2 самых длинных уникальных фрагмента
+    parts = [p.strip(" «»\"") for p in parts if p.strip()]
+    parts_sorted = sorted(parts, key=lambda x: len(x), reverse=True)
+    uniq = []
+    for p in parts_sorted:
+        if p not in uniq:
+            # убираем вложенные дубликаты типа "СОЧИ" внутри "ХК СОЧИ"
+            if any((p in u) or (u in p) for u in uniq):
+                if len(p) > len(uniq[0]):
+                    uniq[0] = p
+                continue
+            uniq.append(p)
+        if len(uniq) == 2:
+            break
+    if len(uniq) >= 2:
+        teams = [uniq[0], uniq[1]]
+
+# 3) Судьи
+main_refs = []
+linesmen  = []
+
+# Подход: найдём служебную строку "Главный судья ... Линейный судья ...", 
+# следующие 1–2 строки содержат 4 ФИО подряд. Возьмём 1–2 как главные, 3–4 как линейные.
+hdr_idx = None
+for i, ln in enumerate(lines):
+    if ("Главный судья" in ln) and ("Линейный судья" in ln):
+        hdr_idx = i
+        break
+
+def split_fio(s):
+    # Разбить на пары "Фамилия Имя( Отчество)" — дадим чуть свободы: возьмём блоки по две-три "слова с заглавной"
+    words = [w for w in s.split() if re.match(r"^[А-ЯЁA-Z][а-яёa-z\-\.]+$", w)]
+    out = []
+    i=0
+    while i < len(words):
+        # минимум 2 слова (Фамилия Имя), опционально 3-е — отчество/инициал
+        if i+1 < len(words):
+            fio = words[i]
+            fio += " " + words[i+1]
+            if i+2 < len(words) and re.match(r"^[А-ЯЁA-Z][а-яёa-z\-\.]+$", words[i+2]):
+                # возможно отчество/инициал
+                fio += " " + words[i+2]
+                i += 3
+            else:
+                i += 2
+            out.append(fio)
+        else:
+            break
+    return out
+
+if hdr_idx is not None:
+    # имена обычно на следующей строке
+    for j in range(1, 3):
+        if hdr_idx + j < len(lines):
+            cand = lines[hdr_idx + j]
+            if "Обновлено" in cand or "Главный тренер" in cand:
+                continue
+            persons = split_fio(cand)
+            if persons:
+                # На примере видно 4 ФИО подряд
+                if len(persons) >= 2 and not main_refs:
+                    main_refs = persons[:2]
+                if len(persons) >= 4 and not linesmen:
+                    linesmen = persons[2:4]
+                # если всего 2 — считаем их главными, линейных не нашлось
+                if len(persons) == 2 and not main_refs:
+                    main_refs = persons
+
+# 4) Вратари
+goalies = {"home": [], "away": []}
+# Найдём строку "Вратари Вратари", заберём следующие 3–4 строки и на каждой вытащим ЛЕВЫЙ и ПРАВЫЙ блок
+vr_idx = None
+for i, ln in enumerate(lines):
+    if re.search(r"\bВратари\b.*\bВратари\b", ln):
+        vr_idx = i
+        break
+
+# Регекс фрагмента одного вратаря (номер, буква В, Фамилия Имя, опционально статус (С|Р), затем дата)
+# Будем искать внутри строки два раза: левый и правый матч.
+re_one = re.compile(
+    r"(?P<num>\d{1,2})\s+В\s+(?P<name>[А-ЯЁA-Z][^0-9()]+?)\s+(?:\((?P<sr>[СР])\)\s*)?\d{2}[.]\d{2}[.]\d{4}",
+    re.U
+)
+
+def clean_name(s:str)->str:
+    # убрать лишние точки и двойные пробелы
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace(" .", ".").strip(" .")
+    return s
+
+if vr_idx is not None:
+    for ofs in range(1, 5):  # до 4 строк посмотрим
+        k = vr_idx + ofs
+        if k >= len(lines): break
+        l = lines[k]
+        if not l or "Звено" in l or "Главный тренер" in l: break
+        found = list(re_one.finditer(l))
+        if not found:
+            continue
+        # если найдено 1 — отнесём к home, если 2 — [home, away]
+        if len(found) == 1:
+            f = found[0]
+            name = clean_name(f.group("name"))
+            sr   = f.group("sr") or ""
+            status = {"С":"starter", "Р":"reserve"}.get(sr, "")
+            goalies["home"].append({"number": int(f.group("num")), "name": name, "status": status})
+        else:
+            left, right = found[0], found[1]
+            for side, f in (("home", left), ("away", right)):
+                name = clean_name(f.group("name"))
+                sr   = f.group("sr") or ""
+                status = {"С":"starter", "Р":"reserve"}.get(sr, "")
+                goalies[side].append({"number": int(f.group("num")), "name": name, "status": status})
+
+out = {
+    "ok": True,
+    "uid": UID,
+    "data": {
+        "teams": teams,
+        "date": date,
+        "time_msk": time_msk,
+        "main_referees": main_refs,
+        "linesmen": linesmen,
+        "goalies": goalies
+    }
+}
+
+path = pathlib.Path(OUT_DIR) / f"{UID}.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+print("JSON written:", path)
+PY
+
+      - name: Show TREE of public
+        run: |
+          echo "--- TREE public"
+          ls -laR public || true
+
+      - name: Upload artifact (public)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
