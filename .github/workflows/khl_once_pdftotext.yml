@@ -66,117 +66,132 @@ jobs:
       - name: Parse → JSON (teams / time / date / referees / goalies)
         run: |
           python - <<'PY'
-          import os, re, json, pathlib
-          from datetime import datetime
+          import os, re, json, pathlib, unicodedata
+from datetime import datetime
 
-          UID = int(os.environ["UID"])
-          OUT_DIR = os.environ["OUT_DIR"]
+UID = int(os.environ["UID"])
+OUT_DIR = os.environ["OUT_DIR"]
 
-          raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
+raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
 
-          def norm_line(s:str)->str:
-              s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
-              s = re.sub(r"[ \t]+"," ", s)
-              return s.strip()
+def norm_keep_spaces(s: str) -> str:
+    # только заменить нестандартные пробелы и убрать хвостовые, НО НЕ схлопывать
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
+    return s.rstrip()
 
-          lines = [norm_line(x) for x in raw.splitlines() if x.strip()]
-          full  = "\n".join(lines)
+lines = [norm_keep_spaces(x) for x in raw.splitlines() if x.strip()]
+full  = "\n".join(l.strip() for l in lines)  # для поиска по всему тексту
 
-          # TEAMS
-          teams=[None,None]
-          try:
-              i_match = next(i for i,l in enumerate(lines) if re.search(r"\bМатч\b.*№", l))
-              for cand in lines[i_match+1:i_match+6]:
-                  parts = [p.strip(' "«»') for p in re.split(r"\s{2,}", cand) if p.strip()]
-                  if len(parts)>=2:
-                      teams=[parts[0], parts[1]]
-                      break
-              if teams==[None,None]:
-                  cand = lines[i_match+1] if i_match+1<len(lines) else ""
-                  m = re.search(r'(.+?)\s+[–—-]\s+(.+)', cand)
-                  if m: teams=[m.group(1).strip(' "«»'), m.group(2).strip(' "«»')]
-          except StopIteration:
-              pass
+# --- TEAMS (после "Матч №", следующая непустая строка; делим по >=3 пробелам) ---
+teams = [None, None]
+try:
+    i_match = next(i for i,l in enumerate(lines) if re.search(r"\bМатч\b.*№", l))
+    for cand in lines[i_match+1:i_match+6]:
+        parts = [p.strip(' "«»') for p in re.split(r"\s{3,}", cand) if p.strip()]
+        if len(parts) >= 2:
+            teams = [parts[0], parts[1]]
+            break
+    if teams == [None, None]:
+        # запасной разделитель — длинное тире
+        cand = lines[i_match+1] if i_match+1 < len(lines) else ""
+        m = re.search(r'(.+?)\s+[–—-]\s+(.+)', cand)
+        if m:
+            teams = [m.group(1).strip(' "«»'), m.group(2).strip(' "«»')]
+except StopIteration:
+    pass
 
-          # TIME
-          m_time = re.search(r"Начало\s*матча\s*:\s*(\d{2}:\d{2})", full)
-          time_msk = m_time.group(1) if m_time else None
+# --- TIME ---
+m_time = re.search(r"Начало\s*матча\s*:\s*(\d{2}:\d{2})", full)
+time_msk = m_time.group(1) if m_time else None
 
-          # DATE
-          m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
-          if m_upd:
-              date = m_upd.group(1).replace("/", ".").replace("-", ".")
-          else:
-              all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
-              def to_dt(s):
-                  s = s.replace("/", ".").replace("-", ".")
-                  try: return datetime.strptime(s, "%d.%m.%Y")
-                  except: return None
-              cands = [to_dt(d) for d in all_dates]
-              cands = [d for d in cands if d and 2024 <= d.year <= 2030]
-              date = max(cands).strftime("%d.%m.%Y") if cands else None
+# --- DATE (сначала 'Обновлено:', иначе макс. дата 2024–2030) ---
+m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
+if m_upd:
+    date = m_upd.group(1).replace("/", ".").replace("-", ".")
+else:
+    all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
+    def to_dt(s):
+        s = s.replace("/", ".").replace("-", ".")
+        try: return datetime.strptime(s, "%d.%m.%Y")
+        except: return None
+    cands = [to_dt(d) for d in all_dates]
+    cands = [d for d in cands if d and 2024 <= d.year <= 2030]
+    date = max(cands).strftime("%d.%m.%Y") if cands else None
 
-          # REFEREES
-          main_referees, linesmen = [], []
-          idx_role = None
-          for i,l in enumerate(lines[-150:], start=len(lines)-150):
-              if "Главный судья" in l and "Линейный судья" in l:
-                  idx_role = i
-          if idx_role is not None:
-              fio_pool = " ".join(lines[idx_role+1: idx_role+3])
-              segs = [s for s in re.split(r"\s{2,}", fio_pool) if s.strip()]
-              if len(segs)<4:
-                  toks = fio_pool.split()
-                  segs = [" ".join(toks[i:i+2]) for i in range(0, min(8,len(toks)), 2)]
-              main_referees = segs[:2]
-              linesmen = segs[2:4] if len(segs)>=4 else []
+# --- REFEREES ---
+main_referees, linesmen = [], []
+# в логах видно:
+#  "Главный судья Главный судья Линейный судья Линейный судья"
+#  следующая строка: 4 ФИО подряд
+idx_role = None
+for i,l in enumerate(lines):
+    if "Главный судья" in l and "Линейный судья" in l:
+        idx_role = i
+        break
+if idx_role is not None and idx_role + 1 < len(lines):
+    fio_line = " ".join(lines[idx_role+1: idx_role+3]).strip()
+    # попробуем сначала порезать по >=3 пробелам (если колонки)
+    segs = [s.strip() for s in re.split(r"\s{3,}", fio_line) if s.strip()]
+    # если не получилось — склеено: группируем по 2 токена ("Фамилия Имя")
+    if len(segs) < 4:
+        toks = [t for t in fio_line.split() if t]
+        pairs = [" ".join(toks[i:i+2]) for i in range(0, min(len(toks), 8), 2)]
+        segs = pairs
+    main_referees = segs[:2]
+    linesmen      = segs[2:4] if len(segs) >= 4 else []
 
-          if not main_referees and not linesmen:
-              name_re = re.compile(r'^[А-ЯЁ][а-яё\-]+ [А-ЯЁ][а-яё\-]+$')
-              tail = [l for l in lines[-150:] if name_re.match(l)]
-              tail = list(dict.fromkeys(tail))
-              last4 = tail[-4:] if len(tail)>=4 else tail
-              main_referees = last4[:2]
-              linesmen = last4[2:4] if len(last4)>=4 else []
+# --- GOALIES ---
+goal_home, goal_away = [], []
+# ищем шапку "Вратари    Вратари" (две колонки)
+idx_g = None
+for i,l in enumerate(lines):
+    if re.search(r"\bВратари\b\s{3,}\bВратари\b", l):
+        idx_g = i
+        break
 
-          # GOALIES
-          goal_home, goal_away = [], []
-          idx_g = None
-          for i,l in enumerate(lines):
-              if re.search(r"\bВратари\b\s{2,}\bВратари\b", l):
-                  idx_g = i; break
+def strip_accents(s: str) -> str:
+    # убираем диакритику, чтобы имена не были "Никола́ ев"
+    return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
 
-          def parse_goalie_segment(seg: str):
-              mstat = re.search(r"\b([СР])\s*\d{2}\.\d{2}\.\d{4}\b", seg)
-              status = {"С":"starter","Р":"reserve"}.get(mstat.group(1), "") if mstat else ""
-              mname = re.search(r"[А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё\-]+){1,2}", seg)
-              name = mname.group(0) if mname else seg.strip()
-              return {"name": name, "gk_status": status}
+def parse_goalie_segment(seg: str):
+    seg_clean = strip_accents(seg)
+    # статус перед датой рождения: "... С 25.01.2000" или "... Р 12.07.2006"
+    mstat = re.search(r"\b([СР])\s*\d{2}\.\d{2}\.\d{4}\b", seg_clean)
+    status = {"С":"starter","Р":"reserve"}.get(mstat.group(1), "") if mstat else ""
+    # имя: после "В " (позиция) возьмём 2–3 слова кириллицей, до статуса/даты
+    mname = re.search(r"\bВ\s+([А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё\-\.]+){1,2})\b", seg_clean)
+    name = mname.group(1) if mname else seg_clean.strip()
+    # подчистим одиночные инициалы типа "Н." на конце
+    name = re.sub(r"\s+[А-ЯЁ]\.$", "", name).strip()
+    return {"name": name, "gk_status": status}
 
-          if idx_g is not None:
-              for row in lines[idx_g+1 : min(idx_g+8, len(lines))]:
-                  parts = re.split(r"\s{10,}", row)
-                  if len(parts) >= 2:
-                      left, right = parts[0], parts[-1]
-                      if left.strip():  goal_home.append(parse_goalie_segment(left))
-                      if right.strip(): goal_away.append(parse_goalie_segment(right))
+if idx_g is not None:
+    # обычно 3 строки ниже с двумя колонками
+    for row in lines[idx_g+1 : min(idx_g+6, len(lines))]:
+        parts = re.split(r"\s{3,}", row)  # сохраняем колонки благодаря НЕсхлопыванию пробелов
+        if len(parts) >= 2:
+            left, right = parts[0].strip(), parts[-1].strip()
+            if left:  goal_home.append(parse_goalie_segment(left))
+            if right: goal_away.append(parse_goalie_segment(right))
 
-          out = {
-            "ok": True,
-            "uid": UID,
-            "data": {
-              "teams": teams,
-              "date": date,
-              "time_msk": time_msk,
-              "main_referees": main_referees,
-              "linesmen": linesmen,
-              "goalies": { "home": goal_home, "away": goal_away }
-            }
-          }
-          p = pathlib.Path(OUT_DIR) / f"{UID}.json"
-          p.parent.mkdir(parents=True, exist_ok=True)
-          p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("Wrote", p)
+out = {
+  "ok": True,
+  "uid": UID,
+  "data": {
+    "teams": teams,
+    "date": date,
+    "time_msk": time_msk,
+    "main_referees": main_referees,
+    "linesmen": linesmen,
+    "goalies": { "home": goal_home, "away": goal_away }
+  }
+}
+p = pathlib.Path(OUT_DIR) / f"{UID}.json"
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+print("Wrote", p)
+
           PY
 
       - name: Upload artifact (public)
