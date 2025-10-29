@@ -50,12 +50,28 @@ HEADERS = {
     "Accept-Language": "ru,en;q=0.9",
 }
 
-with httpx.Client(http2=True, follow_redirects=True, timeout=30) as c:
-    r = c.get(PDF, headers=HEADERS)
-    r.raise_for_status()
-    doc = fitz.open(stream=r.content, filetype="pdf")
-    full = "\n".join(p.get_text("text") for p in doc)
-    doc.close()
+import subprocess, tempfile, pathlib
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+HEADERS = [
+    "-H", "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    "-H", "Accept-Language: ru,en;q=0.9",
+    "-H", "Referer: https://khl.ru/",
+    "-H", f"User-Agent: {UA}",
+]
+
+# Скачаем PDF во временный файл через curl
+tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+tmp_pdf.close()
+cmd = ["curl", "-sSL", "--http2", "--fail", "-o", tmp_pdf.name] + HEADERS + [PDF]
+subprocess.run(cmd, check=True)
+
+# Читаем контент и парсим текст
+pdf_bytes = pathlib.Path(tmp_pdf.name).read_bytes()
+doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+full = "\n".join(p.get_text("text") for p in doc)
+doc.close()
+
 
           full = norm(full); lines=[norm(x) for x in full.splitlines() if x.strip()]
           m = RE_TEAMS.search(full); teams=[m.group(1).strip(' "«»'), m.group(2).strip(' "«»')] if m else [None,None]
