@@ -29,85 +29,92 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Fetch PDF → parse → write JSON
-        run: |
-          mkdir -p "$OUT_DIR"
-          python - <<'PY'
-          import os, re, json, pathlib, httpx, fitz
-          UID = int(os.environ["UID"]); SEASON = int(os.environ["SEASON"])
-          OUT_DIR = os.environ["OUT_DIR"]
-          PDF = f"https://khl.ru/pdf/{SEASON}/{UID}/game-{UID}-start-ru.pdf"
-          def norm(t): return re.sub(r"[ \t]+"," ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
-          RE_TEAMS = re.compile(r'^\s*([A-Za-zА-Яа-яЁё ."«»\-]+)\s[–—\-]\s([A-Za-zА-Яа-яЁё ."«»\-]+)\s*$', re.M)
-          RE_DATE  = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4})")
-          RE_TIME  = re.compile(r"(\d{2}:\d{2})")
-          RE_REFS  = re.compile(r"Главн(?:ые)?\s+судьи?\s*[:\-]?\s*([^\n]+)", re.I)
-          RE_LINS  = re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.I)
-          RE_PL    = re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.I)
-HEADERS = {
-    "Referer": "https://khl.ru/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru,en;q=0.9",
-}
+  run: |
+    mkdir -p "$OUT_DIR"
+    python - <<'PY'
+    import os, re, json, pathlib, fitz, subprocess, tempfile
 
-import subprocess, tempfile, pathlib
+    UID = int(os.environ["UID"])
+    SEASON = int(os.environ["SEASON"])
+    OUT_DIR = os.environ["OUT_DIR"]
+    PDF = f"https://khl.ru/pdf/{SEASON}/{UID}/game-{UID}-start-ru.pdf"  # без www
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-HEADERS = [
-    "-H", "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-    "-H", "Accept-Language: ru,en;q=0.9",
-    "-H", "Referer: https://khl.ru/",
-    "-H", f"User-Agent: {UA}",
-]
+    def norm(t):
+        return re.sub(r"[ \t]+", " ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
 
-# Скачаем PDF во временный файл через curl
-tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-tmp_pdf.close()
-cmd = ["curl", "-sSL", "--http2", "--fail", "-o", tmp_pdf.name] + HEADERS + [PDF]
-subprocess.run(cmd, check=True)
+    RE_TEAMS = re.compile(r'^\s*([A-Za-zА-Яа-яЁё ."«»\-]+)\s[–—\-]\s([A-Za-zА-Яа-яЁё ."«»\-]+)\s*$', re.M)
+    RE_DATE  = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4})")
+    RE_TIME  = re.compile(r"(\d{2}:\d{2})")
+    RE_REFS  = re.compile(r"Главн(?:ые)?\s+судьи?\s*[:\-]?\s*([^\n]+)", re.I)
+    RE_LINS  = re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.I)
+    RE_PL    = re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.I)
 
-# Читаем контент и парсим текст
-pdf_bytes = pathlib.Path(tmp_pdf.name).read_bytes()
-doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-full = "\n".join(p.get_text("text") for p in doc)
-doc.close()
+    # --- СКАЧИВАЕМ PDF ЧЕРЕЗ CURL (чтобы убрать 403) ---
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    headers = [
+        "-H", "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+        "-H", "Accept-Language: ru,en;q=0.9",
+        "-H", "Referer: https://khl.ru/",
+        "-H", f"User-Agent: {UA}",
+    ]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf"); tmp.close()
+    cmd = ["curl", "-sSL", "--http2", "--fail", "-o", tmp.name] + headers + [PDF]
+    subprocess.run(cmd, check=True)
 
+    pdf_bytes = pathlib.Path(tmp.name).read_bytes()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full = "\n".join(p.get_text("text") for p in doc)
+    doc.close()
 
-          full = norm(full); lines=[norm(x) for x in full.splitlines() if x.strip()]
-          m = RE_TEAMS.search(full); teams=[m.group(1).strip(' "«»'), m.group(2).strip(' "«»')] if m else [None,None]
-          date = (RE_DATE.search(full).group(1).replace("/",".").replace("-",".")) if RE_DATE.search(full) else None
-          time_msk = (RE_TIME.search(full).group(1)) if RE_TIME.search(full) else None
-          split=lambda s:[x.strip(" .") for x in re.split(r"[;,]", s) if x.strip()]
-          refs = split(RE_REFS.search(full).group(1)) if RE_REFS.search(full) else []
-          lins = split(RE_LINS.search(full).group(1)) if RE_LINS.search(full) else []
-          goal={"home":[],"away":[]}
-          idxs=[i for i,l in enumerate(lines) if re.search(r"\bВратар[ьи]\b", l, re.I)]
-          blocks=[]
-          for i in idxs:
-              blk=[]
-              for j in range(i+1, min(i+22,len(lines))):
-                  t=lines[j].strip()
-                  if not t or re.match(r"^\w+\s*:", t): break
-                  blk.append(t)
-              blocks.append(blk)
-          def parse_blk(b):
-              out=[]
-              for l in b:
-                  mm=RE_PL.search(l)
-                  if mm:
-                      num=int(mm.group(1)); last=mm.group(2).title(); first=mm.group(3).title()
-                      stat=(mm.group(4) or mm.group(5) or "").upper()
-                      status={"С":"starter","Р":"reserve"}.get(stat,"")
-                      out.append({"number":num,"name":f"{last} {first}","status":status})
-              return out
-          if blocks: goal["home"]=parse_blk(blocks[0])
-          if len(blocks)>1: goal["away"]=parse_blk(blocks[1])
-          out={"ok":True,"uid":UID,"pdf_url":PDF,"data":{"teams":teams,"date":date,"time_msk":time_msk,"main_referees":refs,"linesmen":lins,"goalies":goal}}
-          path = pathlib.Path(OUT_DIR)/f"{UID}.json"
-          path.parent.mkdir(parents=True, exist_ok=True)
-          path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("Wrote", path)
-          PY
+    full = norm(full); lines = [norm(x) for x in full.splitlines() if x.strip()]
+
+    m = RE_TEAMS.search(full)
+    teams = [m.group(1).strip(' "«»'), m.group(2).strip(' "«»')] if m else [None, None]
+
+    date = (RE_DATE.search(full).group(1).replace("/",".").replace("-",".")) if RE_DATE.search(full) else None
+    time_msk = (RE_TIME.search(full).group(1)) if RE_TIME.search(full) else None
+
+    split = lambda s: [x.strip(" .") for x in re.split(r"[;,]", s) if x.strip()]
+    refs = split(RE_REFS.search(full).group(1)) if RE_REFS.search(full) else []
+    lins = split(RE_LINS.search(full).group(1)) if RE_LINS.search(full) else []
+
+    goal = {"home": [], "away": []}
+    idxs = [i for i,l in enumerate(lines) if re.search(r"\bВратар[ьи]\b", l, re.I)]
+    blocks = []
+    for i in idxs:
+        blk=[]
+        for j in range(i+1, min(i+22, len(lines))):
+            t = lines[j].strip()
+            if not t or re.match(r"^\w+\s*:", t): break
+            blk.append(t)
+        blocks.append(blk)
+    def parse_blk(b):
+        out=[]
+        for l in b:
+            mm = RE_PL.search(l)
+            if mm:
+                num = int(mm.group(1))
+                last = mm.group(2).title(); first = mm.group(3).title()
+                stat = (mm.group(4) or mm.group(5) or "").upper()
+                status = {"С":"starter","Р":"reserve"}.get(stat, "")
+                out.append({"number": num, "name": f"{last} {first}", "status": status})
+        return out
+    if blocks: goal["home"] = parse_blk(blocks[0])
+    if len(blocks)>1: goal["away"] = parse_blk(blocks[1])
+
+    out = {
+        "ok": True,
+        "uid": UID,
+        "pdf_url": PDF,
+        "data": {"teams": teams, "date": date, "time_msk": time_msk,
+                 "main_referees": refs, "linesmen": lins, "goalies": goal}
+    }
+    p = pathlib.Path(OUT_DIR) / f"{UID}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Wrote", p)
+    PY
+
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
