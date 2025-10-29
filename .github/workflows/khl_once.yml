@@ -43,10 +43,20 @@ jobs:
           RE_REFS  = re.compile(r"Главн(?:ые)?\s+судьи?\s*[:\-]?\s*([^\n]+)", re.I)
           RE_LINS  = re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.I)
           RE_PL    = re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.I)
-          with httpx.Client(follow_redirects=True, timeout=30) as c:
-              r = c.get(PDF, headers={"Referer":"https://www.khl.ru/"}); r.raise_for_status()
-              doc = fitz.open(stream=r.content, filetype="pdf")
-              full = "\n".join(p.get_text("text") for p in doc); doc.close()
+HEADERS = {
+    "Referer": "https://www.khl.ru/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru,en;q=0.9",
+}
+
+with httpx.Client(follow_redirects=True, timeout=30) as c:
+    r = c.get(PDF, headers=HEADERS)
+    r.raise_for_status()
+    doc = fitz.open(stream=r.content, filetype="pdf")
+    full = "\n".join(p.get_text("text") for p in doc)
+    doc.close()
+
           full = norm(full); lines=[norm(x) for x in full.splitlines() if x.strip()]
           m = RE_TEAMS.search(full); teams=[m.group(1).strip(' "«»'), m.group(2).strip(' "«»')] if m else [None,None]
           date = (RE_DATE.search(full).group(1).replace("/",".").replace("-",".")) if RE_DATE.search(full) else None
