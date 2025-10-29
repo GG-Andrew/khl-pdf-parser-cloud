@@ -41,7 +41,7 @@ jobs:
             -o /tmp/game.pdf "$PDF_URL"
 
           python - <<'PY'
-          import re, pathlib, fitz, unicodedata
+          import re, pathlib, fitz, unicodedata, os
 
 def norm(s:str)->str:
     s = unicodedata.normalize("NFKC", s)
@@ -69,6 +69,7 @@ for i,l in enumerate(lines[:60],1):
 print("\n===== TAIL 120 LINES =====")
 for i,l in enumerate(lines[-120:], max(1,len(lines)-119)):
     print(f"{i:03d}: {l}")
+
 
           PY
 
