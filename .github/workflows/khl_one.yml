@@ -1,14 +1,14 @@
-name: KHL ONE — make JSON
+name: KHL ONE → JSON (pdftotext)
 
 on:
   workflow_dispatch:
     inputs:
-      UID:
-        description: KHL match UID
+      uid:
+        description: "KHL match UID (e.g. 897694)"
         required: true
         default: "897694"
-      SEASON:
-        description: KHL season code
+      season:
+        description: "KHL season (e.g. 1369)"
         required: true
         default: "1369"
 
@@ -23,91 +23,112 @@ concurrency:
 
 jobs:
   build:
-    name: Build public artifacts
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: MARKER — USING PDFTOTEXT (not fitz)
+        run: echo "PARSER_MARK: PDFTOTEXT_V3"
+
       - name: Install poppler-utils (pdftotext)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y poppler-utils
-          python -m pip install --upgrade pip
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
 
       - name: Fetch PDF
         env:
-          UID: ${{ inputs.UID }}
-          SEASON: ${{ inputs.SEASON }}
+          UID: ${{ github.event.inputs.uid }}
+          SEASON: ${{ github.event.inputs.season }}
         run: |
           set -e
-          mkdir -p public/khl/json public/khl/raw
-          PDF_URL="https://khl.ru/pdf/${SEASON}/${UID}/game-${UID}-start-ru.pdf"
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          URL="https://khl.ru/pdf/${SEASON}/${UID}/game-${UID}-start-ru.pdf"
+          mkdir -p /tmp
           curl -sSL --http2 --fail \
             -H "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8" \
             -H "Accept-Language: ru,en;q=0.9" \
             -H "Referer: https://khl.ru/" \
-            -H "User-Agent: $UA" \
-            -o /tmp/game.pdf "$PDF_URL"
-          pdftotext -layout -nopgbrk /tmp/game.pdf public/khl/raw/${UID}_game.txt
-          tail -n 150 public/khl/raw/${UID}_game.txt > public/khl/raw/${UID}_tail150.txt
+            -H "User-Agent: ${UA}" \
+            -o /tmp/game.pdf "${URL}"
 
-      - name: Parse → JSON (teams / date / time / referees)
-        env:
-          UID: ${{ inputs.UID }}
+      - name: pdftotext -layout (dump head/tail)
         run: |
-          python - <<'PY'
-          import re, json, os, unicodedata, datetime as dt
-          uid = os.environ["UID"]
-          txt = f"public/khl/raw/{uid}_game.txt"
-          with open(txt, encoding="utf-8", errors="ignore") as f:
-              raw = f.read()
+          set -e
+          pdftotext -layout -nopgbrk /tmp/game.pdf /tmp/game.txt
+          echo "===== HEAD 40 ====="
+          nl -ba /tmp/game.txt | sed -n '1,40p'
+          echo "===== TAIL 80 ====="
+          L=$(wc -l </tmp/game.txt); S=$((L-79)); [ $S -lt 1 ] && S=1; nl -ba /tmp/game.txt | sed -n "${S},${L}p"
 
-          def norm(s: str) -> str:
+      - name: Parse → JSON (teams / time / date / referees)
+        env:
+          UID: ${{ github.event.inputs.uid }}
+        run: |
+          set -e
+          mkdir -p public/khl/json public/khl/raw
+          cp /tmp/game.txt "public/khl/raw/${UID}_game.txt"
+          python - <<'PY'
+          import re, json, os, unicodedata, datetime as dt, pathlib
+
+          uid = os.environ["UID"]
+          raw_path = pathlib.Path(f"public/khl/raw/{uid}_game.txt")
+          raw = raw_path.read_text(encoding="utf-8", errors="ignore")
+
+          def norm(s:str)->str:
               s = unicodedata.normalize("NFKC", s)
               s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
-              return re.sub(r"[ \t]+"," ", s).strip()
+              s = re.sub(r"[ \t]+"," ", s)
+              return s.strip()
 
           lines = [norm(x) for x in raw.splitlines() if x.strip()]
           full  = "\n".join(lines)
 
-          # TEAMS (title style)
+          # ---------- TEAMS ----------
           teams = [None, None]
-          m = re.search(r'^\s*([A-ZА-ЯЁ„«»" .\-]+?)\s+(?:ХК\s+)?(?:–|-|—)\s+([A-ZА-ЯЁ„«»" .\-]+?)\s*$', full, re.M|re.I)
-          if not m and len(lines) > 5:
-              # fallback на строку с названиями
-              m = re.search(r'^\s*([A-ЯЁA-Z][^0-9\n]+?)\s+[A-ЯЁA-Z][^0-9\n]+$', lines[5])
-          if m:
-              teams = [m.group(1).strip(' «»"'), m.group(2).strip(' «»"')]
+          idx_hdr = None
+          for i,l in enumerate(lines[:60]):
+              if re.search(r"№\s*Поз", l, re.I):
+                  idx_hdr = i; break
+          if idx_hdr is not None and idx_hdr-1 >= 0:
+              cand = lines[idx_hdr-1]
+              parts = re.split(r"\s{2,}", cand)
+              if len(parts) >= 2:
+                  left, right = parts[0], parts[-1]
+                  def clean_team(s:str)->str:
+                      s = s.strip(' «»"')
+                      s = re.sub(r"^(ХК|HC)\s+", "", s, flags=re.I)
+                      # убираем дубли слов: "Сочи Сочи" → "Сочи"
+                      s = re.sub(r"\b([A-ЯЁA-Za-z]+)\s+\1\b", r"\1", s, flags=re.I)
+                      return " ".join(w.capitalize() for w in s.split())
+                  teams = [clean_team(left), clean_team(right)]
 
-          # TIME
-          mt = re.search(r'Начало матча:\s*(\d{2}:\d{2})', full)
-          if not mt:
-              mt = re.search(r'MSK[: ]+(\d{2}:\d{2})', full)
-          time_msk = mt.group(1) if mt else None
+          # ---------- TIME ----------
+          m_time = re.search(r"Начало\s+матча:\s*(\d{2}:\d{2})", full, re.I) \
+                   or re.search(r"\bMSK[ :]+(\d{2}:\d{2})\b", full)
+          time_msk = m_time.group(1) if m_time else None
 
-          # DATE
-          cand = re.findall(r'\b(\d{2}[./-]\d{2}[./-]\d{4})\b', full)
+          # ---------- DATE ----------
+          cands = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
           def to_dt(s):
-              s = s.replace('/','.').replace('-','.')
-              try: return dt.datetime.strptime(s, '%d.%m.%Y')
-              except: return None
-          dates = [d for d in (to_dt(x) for x in cand) if d and 2024 <= d.year <= 2030]
-          date = dates[-1].strftime('%d.%m.%Y') if dates else None
+              s = s.replace("/", ".").replace("-", ".")
+              for fmt in ("%d.%m.%Y",):
+                  try: return dt.datetime.strptime(s, fmt)
+                  except: pass
+              return None
+          dates = [d for d in (to_dt(x) for x in cands) if d and 2024 <= d.year <= 2030]
+          date = max(dates).strftime("%d.%m.%Y") if dates else None
 
-          # REFEREES (4 ФИО в двух ролях)
+          # ---------- REFEREES ----------
           main_referees, linesmen = [], []
-          for i, l in enumerate(lines[:160]):
-              if 'Главный судья' in l and 'Линейный судья' in l:
+          for i,l in enumerate(lines[:220]):
+              if ("Главный судья" in l and "Линейный судья" in l) or \
+                 ("Главные судьи" in l and "Линейные судьи" in l):
                   pool = " ".join(lines[i:i+3])
-                  names = re.findall(r'[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+', pool)
+                  names = re.findall(r"[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+|[A-Z][a-z]+ [A-Z][a-z]+", pool)
                   main_referees = names[:2]
                   linesmen      = names[2:4]
                   break
@@ -121,12 +142,16 @@ jobs:
                   "time_msk": time_msk,
                   "main_referees": main_referees,
                   "linesmen": linesmen,
-                  "goalies": {"home": [], "away": []}  # в этой версии не парсим таблицу
+                  "goalies": {"home": [], "away": []}
               }
           }
-          os.makedirs("public/khl/json", exist_ok=True)
-          with open(f"public/khl/json/{uid}.json", "w", encoding="utf-8") as f:
-              json.dump(out, f, ensure_ascii=False, indent=2)
+          pathlib.Path(f"public/khl/json/{uid}.json").write_text(
+              json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          pathlib.Path(f"public/khl/raw/{uid}_lines.json").write_text(
+              json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print("OK: wrote json and debug lines")
           PY
 
       - name: Upload artifact (public)
@@ -135,12 +160,11 @@ jobs:
           path: public
 
   deploy:
-    needs: build
-    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
+      - id: deployment
         uses: actions/deploy-pages@v4
