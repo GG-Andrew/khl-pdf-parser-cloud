@@ -49,99 +49,53 @@ OUT_DIR = os.environ["OUT_DIR"]
 def strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
-# 1) Читаем PDF → плоский текст
+# читаем PDF
 pdf_bytes = pathlib.Path("/tmp/game.pdf").read_bytes()
 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-full = "\n".join(p.get_text("text") for p in doc)
+full_text = "\n".join(p.get_text("text") for p in doc)
 doc.close()
 
-full = strip_accents(full)
-lines = [re.sub(r"[ \t]+"," ", x).strip() for x in full.splitlines() if x.strip()]
-n = len(lines)
+# нормализуем
+full_text_norm = strip_accents(full_text).replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
+full_text_norm = re.sub(r"[ \t]+"," ", full_text_norm)
+lines = [l.strip() for l in full_text_norm.splitlines()]
 
-# 2) Команды (строка сразу после "Матч №...")
-teams = [None, None]
-try:
-    i_match = next(i for i,l in enumerate(lines) if "Матч" in l)
-    team_line = lines[i_match+1]
-    # чаще всего две команды стоят в ряд: пробуем делить по " ХК " или по 2+ пробелам
-    if " ХК " in team_line:
-        j = team_line.index(" ХК ")
-        teams = [team_line[:j].strip(' "«»'), team_line[j+1:].strip(' "«»')]
-    else:
-        parts = re.split(r"\s{2,}", team_line)
-        if len(parts) >= 2:
-            teams = [parts[0].strip(' "«»'), parts[1].strip(' "«»')]
-except StopIteration:
-    pass
+# === Диагностика: сохраняем сырой текст ===
+raw_dir = pathlib.Path(OUT_DIR).parent / "raw"  # public/khl/raw
+raw_dir.mkdir(parents=True, exist_ok=True)
 
-# 3) Время/дата (берем дату из "Обновлено:", чтобы не путать с Д.Р. игроков)
-m_time = re.search(r"Начало матча:\s*(\d{2}:\d{2})", full)
-time_msk = m_time.group(1) if m_time else None
+(pathlib.Path(OUT_DIR) / f"{UID}.json").parent.mkdir(parents=True, exist_ok=True)
 
-date = None
-for l in lines[::-1]:
-    if l.startswith("Обновлено:"):
-        m = re.search(r"(\d{2}\.\d{2}\.\d{4})", l)
-        if m:
-            date = m.group(1)
-        break
+# полный текст (много строк)
+(pathlib.Path(raw_dir) / f"{UID}_full.txt").write_text(full_text_norm, encoding="utf-8")
 
-# 4) Судьи: в этом макете есть строка ролей и на следующей — 4 ФИО подряд
-main_referees, linesmen = [], []
-try:
-    i_roles = next(i for i,l in enumerate(lines) if "Главный судья" in l and "Линейный судья" in l)
-    ref_line = lines[i_roles+1]
-    toks = ref_line.split()
-    pairs = [" ".join(toks[k:k+2]) for k in range(0, len(toks), 2)]
-    main_referees = pairs[:2]
-    linesmen = pairs[2:4] if len(pairs) >= 4 else []
-except StopIteration:
-    pass
+# хвост для быстрого просмотра (последние 150 строк)
+tail = "\n".join(lines[-150:])
+(pathlib.Path(raw_dir) / f"{UID}_tail150.txt").write_text(tail, encoding="utf-8")
 
-# 5) Вратари: три строки после заголовка "Вратари Вратари", слева и справа по колонке
-def parse_goalie_segment(seg: str):
-    s = seg
-    m_stat = re.search(r"\b([СР])\s?(\d{2}\.\d{2}\.\d{4})", s)
-    status = {"С":"starter","Р":"reserve"}.get(m_stat.group(1), "") if m_stat else ""
-    m_name = re.search(r"\bВ\s+([A-Za-zА-Яа-яЁё.\- ]+?)\s+[СР]?\s?\d{0,2}\.?\d{0,2}\.?\d{4}", s)
-    name = m_name.group(1).strip() if m_name else ""
-    name = re.sub(r"\b[А-ЯЁ]\.\s*$", "", name).strip()
-    return {"name": name, "gk_status": status}
-
-goal_home, goal_away = [], []
-try:
-    i_g = next(i for i,l in enumerate(lines) if re.fullmatch(r"Вратари\s+Вратари", l))
-    for li in (i_g+1, i_g+2, i_g+3):
-        row = lines[li]
-        # левая часть до правой колонки (начало правой — " NN В ")
-        m = re.search(r"(\d+\s+В\s+.*?)(?=\s+\d+\s+В\s+)", row)
-        if not m:
-            continue
-        left = m.group(1)
-        right = row[m.end():]
-        goal_home.append(parse_goalie_segment(left))
-        goal_away.append(parse_goalie_segment(right))
-except Exception:
-    pass
-
+# временный «пустой» JSON, чтобы страница деплоилась
 out = {
   "ok": True,
   "uid": UID,
   "data": {
-    "teams": teams,
-    "date": date,
-    "time_msk": time_msk,
-    "main_referees": main_referees,
-    "linesmen": linesmen,
-    "goalies": { "home": goal_home, "away": goal_away }
+    "teams": [None, None],
+    "date": None,
+    "time_msk": None,
+    "main_referees": [],
+    "linesmen": [],
+    "goalies": {"home": [], "away": []}
+  },
+  "debug": {
+    "lines_total": len(lines),
+    "hints": [
+      f"Открой raw tail: khl/raw/{UID}_tail150.txt",
+      f"Открой raw full: khl/raw/{UID}_full.txt"
+    ]
   }
 }
+(pathlib.Path(OUT_DIR) / f"{UID}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+print("Wrote diagnostic files.")
 
-p = pathlib.Path(OUT_DIR) / f"{UID}.json"
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-print("Wrote", p)
 
 
           PY
