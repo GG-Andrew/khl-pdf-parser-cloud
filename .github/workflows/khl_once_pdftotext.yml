@@ -68,7 +68,7 @@ jobs:
         echo "PARSER_MARK: V2D"
 
           python - <<'PY'
-          import os, re, json, pathlib, unicodedata
+          import os, re, json, unicodedata, pathlib
 from datetime import datetime
 
 UID = int(os.environ["UID"])
@@ -77,111 +77,116 @@ OUT_DIR = os.environ["OUT_DIR"]
 raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
 
 def strip_accents(s: str) -> str:
-    return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
-def norm_keep(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
+def norm_line(s: str) -> str:
+    s = strip_accents(s)
     s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
-    return s.rstrip()
+    s = re.sub(r"[ \t]+"," ", s)
+    return s.strip()
 
-lines = [norm_keep(x) for x in raw.splitlines() if x.strip()]
-lines_noacc = [strip_accents(x) for x in lines]
-full  = "\n".join(x.strip() for x in lines_noacc)
+lines = [norm_line(x) for x in raw.splitlines() if x.strip()]
+full  = "\n".join(lines)
 
-# --- TEAMS (оставим пока None; это отдельный хелпер под макет) ---
-teams = [None, None]
-
-# --- TIME ---
-m_time = re.search(r"Начало\s*матча\s*:\s*(\d{2}:\d{2})", full)
+# --- Дата/время ---
+m_date = re.search(r"(\d{2})[./-](\d{2})[./-](\d{4})", full)
+date = f"{m_date.group(1)}.{m_date.group(2)}.{m_date.group(3)}" if m_date else None
+m_time = re.search(r"(\d{2}:\d{2})\s*MSK", full, re.I)
 time_msk = m_time.group(1) if m_time else None
 
-# --- DATE ---
-m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
-if m_upd:
-    date = m_upd.group(1).replace("/", ".").replace("-", ".")
-else:
-    all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
-    def to_dt(s):
-        s = s.replace("/", ".").replace("-", ".")
-        try: return datetime.strptime(s, "%d.%m.%Y")
-        except: return None
-    cands = [to_dt(d) for d in all_dates]
-    cands = [d for d in cands if d and 2024 <= d.year <= 2030]
-    date = max(cands).strftime("%d.%m.%Y") if cands else None
+# --- Команды (две колонки в шапке) ---
+teams = [None, None]
+for ln in lines[:20]:
+    # шапка типа: СПАРТАК МОСКВА    ХК СОЧИ СОЧИ
+    if re.search(r"[А-ЯA-Z]{2,}.*\s{2,}.*[А-ЯA-Z]{2,}", ln):
+        parts = re.split(r"\s{2,}", ln)
+        if len(parts) == 2 and all(len(p.strip()) >= 3 for p in parts):
+            teams = [parts[0].strip(' "«»'), parts[1].strip(' "«»')]
+            break
 
-# --- REFEREES ---
-main_referees, linesmen = [], []
-idx_role = None
-for i, l in enumerate(lines_noacc):
-    if "Главный судья" in l and "Линейный судья" in l:
-        idx_role = i
-        break
-if idx_role is not None and idx_role + 1 < len(lines_noacc):
-    fio_line = " ".join(lines_noacc[idx_role+1: idx_role+3]).strip()
-    # Разбиваем на ФИО попарно по словам (Фамилия Имя) — в твоём логе: "Гофман Антон Лазарев Глеб Егоров Сергей Сивов Дмитрий"
-    toks = [t for t in fio_line.split() if t]
-    pairs = [" ".join(toks[i:i+2]) for i in range(0, min(len(toks), 8), 2)]
-    main_referees = pairs[:2]
-    linesmen      = pairs[2:4] if len(pairs) >= 4 else []
-
-# --- GOALIES ---
-goal_home, goal_away = []
-
-# Найдём индекс шапки "Вратари Вратари"
-idx_g = None
-for i, l in enumerate(lines_noacc):
-    if re.search(r"\bВратари\b\s+\bВратари\b", l):
-        idx_g = i
+# --- Судьи (следующая строка после подписей) ---
+main_refs, linesmen = [], []
+for i, ln in enumerate(lines):
+    if re.search(r"Главный судья.*Линейн\w+ судья", ln, re.I):
+        # на следующей строке идут 4 фамилии+имени подряд
+        if i + 1 < len(lines):
+            names_line = lines[i+1]
+            # разбиваем по двум и более пробелам
+            chunks = [c.strip() for c in re.split(r"\s{2,}", names_line) if c.strip()]
+            # если не сработало — fallback по одиночным пробелам, сгруппуем парами
+            if len(chunks) < 4:
+                words = names_line.split()
+                chunks = [" ".join(words[j:j+2]) for j in range(0, min(len(words),8), 2)]
+            if len(chunks) >= 4:
+                main_refs = [chunks[0], chunks[1]]
+                linesmen  = [chunks[2], chunks[3]]
         break
 
-def parse_goalie_segments(line: str):
-    """
-    В строке типа:
-    '70 В Николаев Дмитрий Н. С 25.01.2000 25  44 В Щетилин Алексей С 28.11.2000 24'
-    достаём два блока (левый и правый).
-    """
-    s = line
-    # два вхождения шаблона: номер + 'В' + имя ... + (С|Р) дата
-    pat = re.compile(
-        r'(?P<num>\d{1,2})\s+В\s+'
-        r'(?P<name>[А-ЯЁ][а-яё\-\.]+(?:\s[А-ЯЁ][а-яё\-\.]+){1,3})'
-        r'(?:\s+[СР])?\s+\d{2}\.\d{2}\.\d{4}'
-    )
-    matches = list(pat.finditer(s))
-    out = []
-    for m in matches[:2]:
-        name = m.group("name")
-        # статус ищем отдельно (буква С/Р перед датой)
-        after = s[m.end()-10 : m.end()+20]  # небольшой контекст вокруг даты
-        mstat = re.search(r'\b([СР])\s*\d{2}\.\d{2}\.\d{4}', s[m.start():m.end()+20])
-        status = {"С":"starter","Р":"reserve"}.get(mstat.group(1), "") if mstat else ""
-        # подчистим финальный инициал вида "Н." на конце имени
-        name = re.sub(r'\s+[А-ЯЁ]\.$', '', name).strip()
-        out.append({"name": name, "gk_status": status})
-    return out
+# --- Вратари ---
+goal = {"home": [], "away": []}
+# найдём маркер секции
+idx = None
+for i, ln in enumerate(lines):
+    if re.search(r"\bВратари\b\s+\bВратари\b", ln, re.I):
+        idx = i
+        break
 
-if idx_g is not None:
-    # Возьмём 3 строки после заголовка "Вратари Вратари" (как в твоём TAIL)
-    for row in lines_noacc[idx_g+1 : min(idx_g+4, len(lines_noacc))]:
-        segs = parse_goalie_segments(row)
-        if len(segs) == 2:
-            if not goal_home: goal_home = []
-            if not goal_away: goal_away = []
-            goal_home.append(segs[0])
-            goal_away.append(segs[1])
+def parse_goal_row(text: str):
+    """
+    Парсит одну «ячейку» (левую или правую) с вратарём:
+    '70 В Николаев Дмитрий С 25.01.2000 25' -> dict
+    """
+    # сначала вырежем конец с датой и возрастом
+    text = re.sub(r"\s+\d{2}\.\d{2}\.\d{4}\s+\d{1,2}\s*$", "", text)
+    # номер (в начале)
+    m = re.match(r"^\s*(\d{1,2})\s+В\s+(.*)$", text)
+    if not m:
+        return None
+    num = int(m.group(1))
+    tail = m.group(2).strip()
+    # признак старт/резерв встречается как отдельная буква С/Р
+    status = ""
+    if re.search(r"\bС\b", tail):
+        status = "starter"
+        tail = re.sub(r"\bС\b", "", tail)
+    elif re.search(r"\bР\b", tail):
+        status = "reserve"
+        tail = re.sub(r"\bР\b", "", tail)
+    # фамилия + имя (две первые “слова” после позиции)
+    parts = tail.split()
+    if len(parts) >= 2:
+        name = f"{parts[0]} {parts[1]}"
+    else:
+        name = tail
+    return {"number": num, "name": name, "status": status}
+
+if idx is not None:
+    # берём 1..3 строк после заголовка «Вратари Вратари»
+    for row in lines[idx+1 : idx+4]:
+        # делим строку на левую и правую «колонки» по ≥2 пробелам примерно пополам
+        cols = re.split(r"\s{2,}", row)
+        if len(cols) >= 2:
+            left  = cols[0].strip()
+            right = cols[-1].strip()
+            L = parse_goal_row(left)
+            R = parse_goal_row(right)
+            if L: goal["home"].append(L)
+            if R: goal["away"].append(R)
 
 out = {
-  "ok": True,
-  "uid": UID,
-  "data": {
-    "teams": teams,
-    "date": date,
-    "time_msk": time_msk,
-    "main_referees": main_referees,
-    "linesmen": linesmen,
-    "goalies": { "home": goal_home, "away": goal_away }
-  }
+    "ok": True,
+    "uid": UID,
+    "data": {
+        "teams": teams,
+        "date": date,
+        "time_msk": time_msk,
+        "main_referees": main_refs,
+        "linesmen": linesmen,
+        "goalies": goal
+    }
 }
+
 p = pathlib.Path(OUT_DIR) / f"{UID}.json"
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
