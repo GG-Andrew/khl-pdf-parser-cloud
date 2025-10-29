@@ -35,7 +35,7 @@ jobs:
           import os, re, json, pathlib, httpx, fitz
           UID = int(os.environ["UID"]); SEASON = int(os.environ["SEASON"])
           OUT_DIR = os.environ["OUT_DIR"]
-          PDF = f"https://www.khl.ru/pdf/{SEASON}/{UID}/game-{UID}-start-ru.pdf"
+          PDF = f"https://khl.ru/pdf/{SEASON}/{UID}/game-{UID}-start-ru.pdf"
           def norm(t): return re.sub(r"[ \t]+"," ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
           RE_TEAMS = re.compile(r'^\s*([A-Za-zА-Яа-яЁё ."«»\-]+)\s[–—\-]\s([A-Za-zА-Яа-яЁё ."«»\-]+)\s*$', re.M)
           RE_DATE  = re.compile(r"(\d{2}[./-]\d{2}[./-]\d{4})")
@@ -44,13 +44,13 @@ jobs:
           RE_LINS  = re.compile(r"Линейн(?:ые|ые судьи)\s*[:\-]?\s*([^\n]+)", re.I)
           RE_PL    = re.compile(r"^\s*#?\s*(\d{1,2})\s+([A-Za-zА-Яа-яЁё\-]+)\s+([A-Za-zА-Яа-яЁё\-]+)(?:\s*\((С|Р)\))?\s*(?:\b(С|Р)\b)?", re.I)
 HEADERS = {
-    "Referer": "https://www.khl.ru/",
+    "Referer": "https://khl.ru/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru,en;q=0.9",
 }
 
-with httpx.Client(follow_redirects=True, timeout=30) as c:
+with httpx.Client(http2=True, follow_redirects=True, timeout=30) as c:
     r = c.get(PDF, headers=HEADERS)
     r.raise_for_status()
     doc = fitz.open(stream=r.content, filetype="pdf")
