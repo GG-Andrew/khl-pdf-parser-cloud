@@ -65,6 +65,8 @@ jobs:
 
       - name: Parse → JSON (teams / time / date / referees / goalies)
         run: |
+        echo "PARSER_MARK: V2D"
+
           python - <<'PY'
           import os, re, json, pathlib, unicodedata
 from datetime import datetime
