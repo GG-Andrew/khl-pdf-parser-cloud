@@ -8,7 +8,7 @@ on:
         required: true
         default: "897694"
       season:
-        description: "KHL season code"
+        description: "Season code"
         required: true
         default: "1369"
 
@@ -17,13 +17,20 @@ permissions:
   pages: write
   id-token: write
 
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 env:
-  UID: ${{ inputs.uid }}
-  SEASON: ${{ inputs.season }}
+  UID: ${{ github.event.inputs.uid }}
+  SEASON: ${{ github.event.inputs.season }}
   OUT_DIR: public/khl/json
 
 jobs:
   run:
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
     runs-on: ubuntu-latest
 
     steps:
@@ -35,225 +42,183 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: MARKER — USING PDFTOTEXT (not fitz)
+        run: echo "PARSER_MARK: v2D (pdftotext)"
+
       - name: Install poppler-utils (pdftotext)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y poppler-utils
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
 
       - name: Fetch PDF
-        shell: bash
         run: |
           set -e
-          mkdir -p /tmp
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+          mkdir -p "$OUT_DIR"
           PDF_URL="https://khl.ru/pdf/${SEASON}/${UID}/game-${UID}-start-ru.pdf"
-          echo "[INFO] GET ${PDF_URL}"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          echo "GET $PDF_URL"
           curl -sSL --http2 --fail \
             -H "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8" \
             -H "Accept-Language: ru,en;q=0.9" \
             -H "Referer: https://khl.ru/" \
-            -H "User-Agent: ${UA}" \
-            -o /tmp/game.pdf "${PDF_URL}"
-          ls -l /tmp/game.pdf
+            -H "User-Agent: $UA" \
+            -o /tmp/game.pdf "$PDF_URL"
 
       - name: pdftotext -layout
-        shell: bash
         run: |
           set -e
           pdftotext -layout -nopgbrk /tmp/game.pdf /tmp/game.txt
-          echo "===== HEAD 40 ====="
-          head -n 40 /tmp/game.txt | nl -ba
-          echo "===== TAIL 80 ====="
-          tail -n 80 /tmp/game.txt | nl -ba
-
-      - name: Parse → JSON (teams / date / time / referees / goalies)
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "$OUT_DIR"
-          mkdir -p public/khl/raw
-
+          echo "Dump HEAD/TAIL from pdftotext:"
           python - <<'PY'
-          import os, re, json, pathlib
-from datetime import datetime
-
-UID = int(os.environ["UID"])
-OUT_DIR = os.environ["OUT_DIR"]
-PUBLIC = pathlib.Path("public")
-RAW_DIR = PUBLIC / "khl" / "raw"
-JSON_DIR = PUBLIC / "khl" / "json"
-
-RAW_DIR.mkdir(parents=True, exist_ok=True)
-JSON_DIR.mkdir(parents=True, exist_ok=True)
-
-raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
-
-# Сохраним сырой txt для отладки (чтобы не было 404)
-(pathlib.Path(RAW_DIR) / f"{UID}_game.txt").write_text(raw, encoding="utf-8")
-
-# Нормализация
-def strip_accents(s:str)->str:
-    return (s
-            .replace("\xa0"," ")
-            .replace("\u2009"," ")
-            .replace("\u202f"," ")
-            )
-
-def norm_line(s:str)->str:
-    s = strip_accents(s)
-    s = re.sub(r"[ \t]+"," ", s)
-    return s.strip()
-
-lines = [norm_line(x) for x in raw.splitlines() if x.strip()]
-full  = "\n".join(lines)
-
-# -------- TEAMS --------
-# Словарь допустимых названий (простого вида достаточно)
-KHL_TEAMS = [
-    "АК БАРС", "АВАНГАРД", "АВТОМОБИЛИСТ", "АМУР", "АВТОМОБИЛИСТ ЕКАТЕРИНБУРГ",
-    "БАРЫС", "ВИТЯЗЬ", "ДИНАМО М", "ДИНАМО МИНСК", "ДИНАМО РИГА", "ЙОКЕРИТ",
-    "КУНЬЛУНЬ", "ЛОКОМОТИВ", "МЕТАЛЛУРГ МГ", "НЕФТЕХИМИК", "САЛАВАТ ЮЛАЕВ",
-    "СЕВЕРСТАЛЬ", "СИБИРЬ", "СКА", "СОЧИ", "СПАРТАК МОСКВА", "ТРАКТОР", "ТОРПЕДО", "ЦСКА", "ХК СОЧИ"
-]
-
-def find_teams(lines):
-    # ищем строку с названием двух команд без разделителей, как в примере
-    # возьмём строку около заголовка "№ Поз Фамилия, Имя"
-    cand_idx = None
-    for i,ln in enumerate(lines[:20]):
-        if "№ Поз Фамилия" in ln:
-            cand_idx = max(0, i-1)
-            break
-    if cand_idx is None:
-        # бэкап: ищем строку, где встречается хотя бы одно известное имя команды
-        for i,ln in enumerate(lines[:40]):
-            if sum(1 for t in KHL_TEAMS if t in ln.upper()) >= 1:
-                cand_idx = i
-                break
-
-    if cand_idx is None:
-        return [None, None]
-
-    txt = lines[cand_idx].upper()
-    # выделим все встречающиеся токены из словаря
-    hits = []
-    for t in KHL_TEAMS:
-        if t in txt:
-            hits.append(t)
-    # оставим уникальные и разумное количество (2)
-    uniq = []
-    for h in hits:
-        if h not in uniq:
-            uniq.append(h)
-    if len(uniq) >= 2:
-        # частые дубли вида "ХК СОЧИ" + "СОЧИ" — уберём короткий дубль
-        cleaned = []
-        for h in uniq:
-            if any(h != x and h in x for x in uniq):
-                continue
-            cleaned.append(h)
-        uniq = cleaned or uniq
-        return [uniq[0].title(), uniq[1].title()]
-    return [None, None]
-
-teams = find_teams(lines)
-
-# -------- TIME --------
-m_time = re.search(r"Начало\s+матча:\s*(\d{2}:\d{2})", full)
-time_msk = m_time.group(1) if m_time else None
-
-# -------- DATE --------
-m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
-if m_upd:
-    date = m_upd.group(1).replace("/",".").replace("-",".")
-else:
-    all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
-    def to_dt(s):
-        s = s.replace("/",".").replace("-",".")
-        try: return datetime.strptime(s, "%d.%m.%Y")
-        except: return None
-    cands = [to_dt(d) for d in all_dates]
-    cands = [d for d in cands if d]
-    date = max(cands).strftime("%d.%m.%Y") if cands else None
-
-# -------- REFEREES (главные / лайнсмены) --------
-main_referees, linesmen = [], []
-# Берём компактный блок судей: 3–4 строки вокруг фразы "Главный судья"
-for i,ln in enumerate(lines[:150]):
-    if "ГЛАВНЫЙ СУДЬЯ" in ln.upper():
-        window = " ".join(lines[i:i+3])
-        # Имена через пробелы:
-        fio = re.findall(r"[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}", window)
-        # первые 2 считаем главными, остальные лайнсменами
-        main_referees = fio[:2]
-        linesmen     = fio[2:4]
-        break
-
-# -------- GOALIES --------
-# Берём 3 строки после "Вратари Вратари", разделяем на левую/правую колонку по >=2 пробелов
-goal = {"home":[], "away":[]}
-try:
-    idx = next(i for i,ln in enumerate(lines[:50]) if re.search(r"\bВратари\s+Вратари\b", ln, re.I))
-    goalie_block = lines[idx+1: idx+1+5]  # максимум 4–5 строк
-    def parse_one(side_txt):
-        # формат: "70 В Николаев Дмитрий ... С|Р"
-        m = re.search(r"\b(\d{1,2})\s+В\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+).*?\b(С|Р)\b", side_txt)
-        if not m: 
-            return None
-        num, last, first, stat = m.groups()
-        return {
-            "number": int(num),
-            "name": f"{last} {first}",
-            "status": {"С":"starter","Р":"reserve"}[stat]
-        }
-    for row in goalie_block:
-        parts = re.split(r"\s{2,}", row)
-        if len(parts) >= 2:
-            left, right = parts[0], parts[-1]
-            L = parse_one(left)
-            R = parse_one(right)
-            if L: goal["home"].append(L)
-            if R: goal["away"].append(R)
-except StopIteration:
-    pass
-
-# сохраним распиленные строки для отладки
-(pathlib.Path(RAW_DIR) / f"{UID}_lines.json").write_text(
-    json.dumps(lines, ensure_ascii=False, indent=2),
-    encoding="utf-8"
-)
-
-out = {
-    "ok": True,
-    "uid": UID,
-    "data": {
-        "teams": teams,
-        "date": date,
-        "time_msk": time_msk,
-        "main_referees": main_referees,
-        "linesmen": linesmen,
-        "goalies": goal
-    }
-}
-(pathlib.Path(JSON_DIR) / f"{UID}.json").write_text(
-    json.dumps(out, ensure_ascii=False, indent=2),
-    encoding="utf-8"
-)
-print("Wrote", (JSON_DIR / f"{UID}.json"))
-
+          import re, pathlib
+          raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
+          lines = [re.sub(r"[ \t]+"," ", x).rstrip() for x in raw.splitlines() if x.strip()]
+          print("\n===== HEAD 40 =====")
+          for i,l in enumerate(lines[:40],1): print(f"{i:03d}: {l}")
+          print("\n===== TAIL 80 =====")
+          for i,l in enumerate(lines[-80:],1): print(f"{i:03d}: {l}")
           PY
 
-      - name: Show TREE of public
-        shell: bash
+      - name: Parse → JSON (teams / time / date / referees / goalies)
         run: |
-          echo "--- TREE public"
-          find public -maxdepth 3 -type f -print | sort || true
+          python - <<'PY'
+          import os, re, json, pathlib, unicodedata
+          from datetime import datetime
 
-      - name: Upload artifact (Pages)
+          UID = int(os.environ["UID"])
+          PUBLIC  = pathlib.Path("public")
+          RAW_DIR = PUBLIC / "khl" / "raw"
+          JSON_DIR= PUBLIC / "khl" / "json"
+          RAW_DIR.mkdir(parents=True, exist_ok=True)
+          JSON_DIR.mkdir(parents=True, exist_ok=True)
+
+          raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
+          (RAW_DIR / f"{UID}_game.txt").write_text(raw, encoding="utf-8")
+
+          def strip_marks(s:str)->str:
+              s = unicodedata.normalize("NFKD", s)
+              s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+              s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
+              return s
+          def norm_line(s:str)->str:
+              s = strip_marks(s)
+              s = re.sub(r"[ \t]+"," ", s)
+              return s.strip()
+
+          lines = [norm_line(x) for x in raw.splitlines() if x.strip()]
+          full  = "\n".join(lines)
+          (RAW_DIR / f"{UID}_lines.json").write_text(json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          # ---------- TEAMS ----------
+          KHL_TEAMS = [
+              "АК БАРС","АВАНГАРД","АВТОМОБИЛИСТ","АМУР","БАРЫС","ВИТЯЗЬ","ДИНАМО М","ДИНАМО МИНСК",
+              "ЛОКОМОТИВ","МЕТАЛЛУРГ МГ","НЕФТЕХИМИК","САЛАВАТ ЮЛАЕВ","СЕВЕРСТАЛЬ","СИБИРЬ",
+              "СКА","СОЧИ","ХК СОЧИ","СПАРТАК МОСКВА","ТРАКТОР","ТОРПЕДО","ЦСКА","ЙОКЕРИТ","КУНЬЛУНЬ"
+          ]
+          def find_teams():
+              idx = None
+              for i,ln in enumerate(lines[:25]):
+                  if "№ Поз Фамилия" in ln:
+                      idx = max(0, i-1); break
+              if idx is None:
+                  for i,ln in enumerate(lines[:40]):
+                      if any(t in ln.upper() for t in KHL_TEAMS):
+                          idx = i; break
+              if idx is None: return [None,None]
+              txt = lines[idx].upper()
+              hits = []
+              for t in KHL_TEAMS:
+                  if t in txt: hits.append(t)
+              uniq = []
+              for h in hits:
+                  if h not in uniq: uniq.append(h)
+              # убрать короткие дубли
+              cleaned = []
+              for h in uniq:
+                  if any(h != x and h in x for x in uniq): continue
+                  cleaned.append(h)
+              uniq = cleaned or uniq
+              if len(uniq) >= 2:
+                  return [uniq[0].title(), uniq[1].title()]
+              return [None,None]
+          teams = find_teams()
+
+          # ---------- TIME ----------
+          m_time = re.search(r"Начало\s+матча:\s*(\d{2}:\d{2})", full)
+          time_msk = m_time.group(1) if m_time else None
+
+          # ---------- DATE ----------
+          m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
+          if m_upd:
+              date = m_upd.group(1).replace("/",".").replace("-",".")
+          else:
+              all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
+              def to_dt(s):
+                  s = s.replace("/",".").replace("-",".")
+                  try: return datetime.strptime(s, "%d.%m.%Y")
+                  except: return None
+              cands = [to_dt(d) for d in all_dates]
+              cands = [d for d in cands if d and 2024 <= d.year <= 2030]
+              date = max(cands).strftime("%d.%m.%Y") if cands else None
+
+          # ---------- REFEREES ----------
+          STOPWORDS = {"СОСТАВЫ","КОМАНД","ЗВЕНО","ВРАТАРИ","ГЛАВНЫЙ","СУДЬЯ","ЛИНЕЙНЫЙ","ОБНОВЛЕНО","МАТЧ","НАЧАЛО","MSK","ДС"}
+          def is_name(tok: str) -> bool:
+              up = tok.upper()
+              if any(sw in up for sw in STOPWORDS): return False
+              return bool(re.fullmatch(r"[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}", tok))
+
+          main_referees, linesmen = [], []
+          for i,ln in enumerate(lines[:160]):
+              if "ГЛАВНЫЙ СУДЬЯ" in ln.upper():
+                  window = " ".join(lines[i:i+4])
+                  cands = re.findall(r"[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}", window)
+                  cands = [x for x in cands if is_name(x)]
+                  main_referees = cands[:2]
+                  linesmen     = cands[2:4]
+                  break
+
+          # ---------- GOALIES ----------
+          goal = {"home": [], "away": []}
+          def parse_goalie_side(side_txt: str):
+              m = re.search(r"\b(\d{1,2})\s+В\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+)(?:\s+[А-ЯЁ]\.)?\s+([СР])\b", side_txt)
+              if not m: return None
+              num, last, first, stat = m.groups()
+              return {"number": int(num), "name": f"{last} {first}", "status": "starter" if stat == "С" else "reserve"}
+
+          try:
+              idx = next(i for i,ln in enumerate(lines[:60]) if re.search(r"\bВратари\s+Вратари\b", ln, re.I))
+              for row in lines[idx+1: idx+5]:
+                  parts = re.split(r"\s{2,}", row)
+                  if len(parts) < 2: continue
+                  L, R = parts[0], parts[-1]
+                  l = parse_goalie_side(L)
+                  r = parse_goalie_side(R)
+                  if l: goal["home"].append(l)
+                  if r: goal["away"].append(r)
+          except StopIteration:
+              pass
+
+          out = {
+              "ok": True,
+              "uid": UID,
+              "data": {
+                  "teams": teams,
+                  "date": date,
+                  "time_msk": time_msk,
+                  "main_referees": main_referees,
+                  "linesmen": linesmen,
+                  "goalies": goal
+              }
+          }
+          (JSON_DIR / f"{UID}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("Wrote", (JSON_DIR / f"{UID}.json"))
+          PY
+
+      # === ВАЖНО: грузим весь каталог public, а не только json! ===
+      - name: Upload artifact (public)
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
-      - name: Deploy to Pages
-        id: deployment
+      - name: Deploy to GitHub Pages
+        id: deploy
         uses: actions/deploy-pages@v4
