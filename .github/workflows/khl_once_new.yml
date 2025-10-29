@@ -16,6 +16,19 @@ jobs:
       SEASON: "1369"         # сезон
       OUT_DIR: "public/khl/json"
 
+            - name: Upload artifact (public)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+          environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - uses: actions/checkout@v4
 
