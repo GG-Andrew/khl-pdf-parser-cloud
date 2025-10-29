@@ -26,58 +26,42 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-            - name: Fetch PDF via curl → pdftotext → parse → write JSON
-        run: |
-          set -e
-          mkdir -p "$OUT_DIR"
-          PDF_URL="https://khl.ru/pdf/${{ env.SEASON }}/${{ env.UID }}/game-${{ env.UID }}-start-ru.pdf"
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            - name: Fetch PDF via curl → pdftotext → dump tail
+  run: |
+    set -e
+    mkdir -p "$OUT_DIR"
+    PDF_URL="https://khl.ru/pdf/${{ env.SEASON }}/${{ env.UID }}/game-${{ env.UID }}-start-ru.pdf"
+    UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-          # 1) скачиваем PDF
-          curl -sSL --http2 --fail \
-            -H "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8" \
-            -H "Accept-Language: ru,en;q=0.9" \
-            -H "Referer: https://khl.ru/" \
-            -H "User-Agent: $UA" \
-            -o /tmp/game.pdf "$PDF_URL"
+    # 1) Скачиваем PDF
+    curl -sSL --http2 --fail \
+      -H "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8" \
+      -H "Accept-Language: ru,en;q=0.9" \
+      -H "Referer: https://khl.ru/" \
+      -H "User-Agent: $UA" \
+      -o /tmp/game.pdf "$PDF_URL"
 
-          # 2) ставим pdftotext и извлекаем текст с сохранением колонок/пробелов
-          sudo apt-get update -y
-          sudo apt-get install -y poppler-utils
-          pdftotext -layout -nopgbrk /tmp/game.pdf /tmp/game.txt
+    # 2) Ставим pdftotext и извлекаем текст с сохранением колонок
+    sudo apt-get update -y
+    sudo apt-get install -y poppler-utils
+    pdftotext -layout -nopgbrk /tmp/game.pdf /tmp/game.txt
 
-          # 3) Python: печатаем хвост в лог + пишем JSON (пока без парсинга полей)
-          python - <<'PY'
-          import os, re, json, pathlib
+    # 3) Печатаем хвост/голову в лог (чтобы увидеть реальный текст)
+    python - <<'PY'
+    import re, pathlib
+    raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
+    lines = [re.sub(r"[ \t]+"," ", x).rstrip() for x in raw.splitlines() if x.strip()]
 
-          UID = int(os.environ["UID"])
-          OUT_DIR = os.environ["OUT_DIR"]
+    print("\\n===== HEAD 60 LINES (pdftotext -layout) =====")
+    for i, l in enumerate(lines[:60], 1):
+        print(f"{i:03d}: {l}")
 
-          raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
-          lines = [re.sub(r"[ \t]+"," ", x).rstrip() for x in raw.splitlines() if x.strip()]
+    print("\\n===== TAIL 120 LINES (pdftotext -layout) =====")
+    tail_start = max(0, len(lines)-120)
+    for i, l in enumerate(lines[tail_start:], tail_start+1):
+        print(f"{i:03d}: {l}")
+    PY
 
-          print("\n===== HEAD 60 LINES (pdftotext -layout) =====")
-          for i, l in enumerate(lines[:60], 1):
-              print(f"{i:03d}: {l}")
-          print("\n===== TAIL 120 LINES (pdftotext -layout) =====")
-          tail_start = max(0, len(lines)-120)
-          for i, l in enumerate(lines[tail_start:], tail_start+1):
-              print(f"{i:03d}: {l}")
-
-          # временный JSON, чтобы проверить публикацию
-          out = {
-            "ok": True,
-            "uid": UID,
-            "data": { "teams":[None,None], "date": None, "time_msk": None,
-                      "main_referees": [], "linesmen": [],
-                      "goalies": { "home": [], "away": [] } },
-            "debug": { "source": "pdftotext -layout", "lines_total": len(lines) }
-          }
-          p = pathlib.Path(OUT_DIR) / f"{UID}.json"
-          p.parent.mkdir(parents=True, exist_ok=True)
-          p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("Wrote", p)
-          PY
 
 
       - uses: actions/upload-pages-artifact@v3
