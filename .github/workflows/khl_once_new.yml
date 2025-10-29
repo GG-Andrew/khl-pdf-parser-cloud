@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-            - name: Fetch PDF via curl → pdftotext → dump tail
+            - name: Fetch PDF via curl → pdftotext → parse → write JSON
   run: |
     set -e
     mkdir -p "$OUT_DIR"
@@ -46,21 +46,137 @@ jobs:
     sudo apt-get install -y poppler-utils
     pdftotext -layout -nopgbrk /tmp/game.pdf /tmp/game.txt
 
-    # 3) Печатаем хвост/голову в лог (чтобы увидеть реальный текст)
+    # 3) Парсим текст → JSON
     python - <<'PY'
-    import re, pathlib
+    import os, re, json, pathlib
+    from datetime import datetime
+
+    UID = int(os.environ["UID"])
+    OUT_DIR = os.environ["OUT_DIR"]
+
     raw = pathlib.Path("/tmp/game.txt").read_text(encoding="utf-8", errors="ignore")
-    lines = [re.sub(r"[ \t]+"," ", x).rstrip() for x in raw.splitlines() if x.strip()]
 
-    print("\\n===== HEAD 60 LINES (pdftotext -layout) =====")
-    for i, l in enumerate(lines[:60], 1):
-        print(f"{i:03d}: {l}")
+    # нормализация пробелов
+    def norm_line(s:str)->str:
+        s = s.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," ")
+        s = re.sub(r"[ \t]+"," ", s)
+        return s.strip()
 
-    print("\\n===== TAIL 120 LINES (pdftotext -layout) =====")
-    tail_start = max(0, len(lines)-120)
-    for i, l in enumerate(lines[tail_start:], tail_start+1):
-        print(f"{i:03d}: {l}")
+    lines = [norm_line(x) for x in raw.splitlines() if x.strip()]
+    full  = "\n".join(lines)
+
+    # --- TEAMS ---
+    teams=[None,None]
+    # Ищем строку после "Матч №"
+    try:
+        i_match = next(i for i,l in enumerate(lines) if re.search(r"\bМатч\b.*№", l))
+        # следующая непустая строка должна содержать обе команды (две «колонки»)
+        cand = lines[i_match+1]
+        # пробуем разрез по 2+ пробелам
+        parts = re.split(r"\s{2,}", cand)
+        parts = [p.strip(' "«»') for p in parts if p.strip()]
+        if len(parts)>=2:
+            teams = [parts[0], parts[1]]
+        else:
+            # fallback: длинное тире/длинный дефис
+            m = re.search(r'(.+?)\s+[–—-]\s+(.+)', cand)
+            if m: teams=[m.group(1).strip(' "«»'), m.group(2).strip(' "«»')]
+    except StopIteration:
+        pass
+
+    # --- TIME ---
+    m_time = re.search(r"Начало\s*матча\s*:\s*(\d{2}:\d{2})", full)
+    time_msk = m_time.group(1) if m_time else None
+
+    # --- DATE ---
+    # 1) предпочтительно "Обновлено: dd.mm.yyyy"
+    m_upd = re.search(r"Обновлено:\s*(\d{2}[./-]\d{2}[./-]\d{4})", full)
+    if m_upd:
+        date = m_upd.group(1).replace("/",".").replace("-",".")
+    else:
+        # 2) иначе берём максимум по календарю из разумного интервала
+        all_dates = re.findall(r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b", full)
+        def to_dt(s):
+            s = s.replace("/",".").replace("-",".")
+            try:
+                return datetime.strptime(s, "%d.%m.%Y")
+            except: return None
+        cands = [to_dt(d) for d in all_dates]
+        cands = [d for d in cands if d and 2024 <= d.year <= 2030]
+        date = max(cands).strftime("%d.%m.%Y") if cands else None
+
+    # --- REFEREES (главные/линейные) ---
+    main_referees, linesmen = [], []
+    # У некоторых макетов одна строка ролей и следующая строка — 4 ФИО в ряд
+    idx_role = None
+    for i,l in enumerate(lines[-120:], start=len(lines)-120):
+        if "Главный судья" in l and "Линейный судья" in l:
+            idx_role = i
+    if idx_role is not None and idx_role+1 < len(lines):
+        fio_line = lines[idx_role+1]
+        # делим на 4 сегмента по 2+ пробелам
+        segs = [s for s in re.split(r"\s{2,}", fio_line) if s.strip()]
+        # если склеено — порежем по парам слов (Имя Фамилия)
+        if len(segs) < 4:
+            toks = fio_line.split()
+            segs = [" ".join(toks[i:i+2]) for i in range(0, min(8,len(toks)), 2)]
+        main_referees = segs[:2]
+        linesmen      = segs[2:4] if len(segs) >= 4 else []
+
+    # fallback: если не нашли — возьмём последние 4 «Имя Фамилия» в хвосте
+    if not main_referees and not linesmen:
+        name_re = re.compile(r'^[А-ЯЁ][а-яё\-]+ [А-ЯЁ][а-яё\-]+$')
+        tail = [l for l in lines[-120:] if name_re.match(l)]
+        tail = list(dict.fromkeys(tail))  # дедуп в порядке
+        last4 = tail[-4:] if len(tail)>=4 else tail
+        main_referees = last4[:2]
+        linesmen = last4[2:4] if len(last4)>=4 else []
+
+    # --- GOALIES ---
+    # Ищем строку "Вратари    Вратари" (две колонки), берём следующие 3 строки
+    goal_home, goal_away = [], []
+    idx_g = None
+    for i,l in enumerate(lines):
+        if re.search(r"\bВратари\b\s{2,}\bВратари\b", l):
+            idx_g = i; break
+    def parse_goalie_segment(seg: str):
+        # статус прямо рядом с датой рождения:  "... С 26.10.2001" / "... Р 01.01.2000"
+        mstat = re.search(r"\b([СР])\s*\d{2}\.\d{2}\.\d{4}\b", seg)
+        status = {"С":"starter","Р":"reserve"}.get(mstat.group(1), "") if mstat else ""
+        # имя — берем 2–3 слова кириллицей
+        mname = re.search(r"[А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё\-]+){1,2}", seg)
+        name = mname.group(0) if mname else seg.strip()
+        return {"name": name, "gk_status": status}
+
+    if idx_g is not None:
+        for row in lines[idx_g+1 : min(idx_g+1+6, len(lines))]:
+            # делим на левую/правую колонку по 10+ пробелам
+            parts = re.split(r"\s{10,}", row)
+            if len(parts) >= 2:
+                left, right = parts[0], parts[-1]
+                if left.strip():
+                    goal_home.append(parse_goalie_segment(left))
+                if right.strip():
+                    goal_away.append(parse_goalie_segment(right))
+
+    out = {
+      "ok": True,
+      "uid": UID,
+      "data": {
+        "teams": teams,
+        "date": date,
+        "time_msk": time_msk,
+        "main_referees": main_referees,
+        "linesmen": linesmen,
+        "goalies": { "home": goal_home, "away": goal_away }
+      }
+    }
+    p = pathlib.Path(OUT_DIR) / f"{UID}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Wrote", p)
     PY
+
 
 
 
