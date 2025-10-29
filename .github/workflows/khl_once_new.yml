@@ -41,77 +41,89 @@ jobs:
             -o /tmp/game.pdf "$PDF_URL"
 
           python - <<'PY'
-          import re, json, pathlib, fitz, os
+          import re, json, pathlib, fitz, os, unicodedata
 
 UID = int(os.environ["UID"])
 OUT_DIR = os.environ["OUT_DIR"]
 
-# 1) Читаем PDF
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+# 1) Читаем PDF → плоский текст
 pdf_bytes = pathlib.Path("/tmp/game.pdf").read_bytes()
 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 full = "\n".join(p.get_text("text") for p in doc)
 doc.close()
 
-def norm(t: str) -> str:
-    return re.sub(r"[ \t]+", " ", t.replace("\xa0"," ").replace("\u2009"," ").replace("\u202f"," "))
-
-full = norm(full)
-lines = [norm(x) for x in full.splitlines() if x.strip()]
+full = strip_accents(full)
+lines = [re.sub(r"[ \t]+"," ", x).strip() for x in full.splitlines() if x.strip()]
 n = len(lines)
 
-# 2) Команды (две строки после «Матч №…»)
+# 2) Команды (строка сразу после "Матч №...")
 teams = [None, None]
 try:
-    idx_match = next(i for i,l in enumerate(lines) if "Матч" in l)
-    take = []
-    for l in lines[idx_match+1: idx_match+12]:
-        if re.search(r"№|Поз|Фамилия|Начало|Лет|Д\.Р\.|Составы|ДС|г\.", l): 
-            continue
-        if len(l.strip()) >= 3:
-            take.append(l.strip(' "«»'))
-        if len(take) == 2:
-            break
-    if len(take) == 2:
-        teams = take
+    i_match = next(i for i,l in enumerate(lines) if "Матч" in l)
+    team_line = lines[i_match+1]
+    # чаще всего две команды стоят в ряд: пробуем делить по " ХК " или по 2+ пробелам
+    if " ХК " in team_line:
+        j = team_line.index(" ХК ")
+        teams = [team_line[:j].strip(' "«»'), team_line[j+1:].strip(' "«»')]
+    else:
+        parts = re.split(r"\s{2,}", team_line)
+        if len(parts) >= 2:
+            teams = [parts[0].strip(' "«»'), parts[1].strip(' "«»')]
 except StopIteration:
     pass
 
-# 3) Время и дата
+# 3) Время/дата (берем дату из "Обновлено:", чтобы не путать с Д.Р. игроков)
 m_time = re.search(r"Начало матча:\s*(\d{2}:\d{2})", full)
 time_msk = m_time.group(1) if m_time else None
 
-dates = re.findall(r"\b(\d{2}\.\d{2}\.\d{4})\b", full)
-date = dates[-1] if dates else None  # берём последнюю (из «Обновлено»)
+date = None
+for l in lines[::-1]:
+    if l.startswith("Обновлено:"):
+        m = re.search(r"(\d{2}\.\d{2}\.\d{4})", l)
+        if m:
+            date = m.group(1)
+        break
 
-# 4) Главные/линейные судьи — берём 4 последних «Имя Фамилия» в нижнем блоке
-name_re = re.compile(r'^[А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё\-]+){1,2}$')
-tail_names = [l.strip() for l in lines[-80:] if name_re.match(l.strip())]
-tail_names = list(dict.fromkeys(tail_names))  # уникальные в порядке встречи
-# часто наверху этого блока бывают ещё «старшие»/резервные — берём последние 4
-last4 = tail_names[-4:] if len(tail_names) >= 4 else tail_names
-main_referees = last4[:2]
-linesmen = last4[2:4] if len(last4) >= 4 else []
+# 4) Судьи: в этом макете есть строка ролей и на следующей — 4 ФИО подряд
+main_referees, linesmen = [], []
+try:
+    i_roles = next(i for i,l in enumerate(lines) if "Главный судья" in l and "Линейный судья" in l)
+    ref_line = lines[i_roles+1]
+    toks = ref_line.split()
+    pairs = [" ".join(toks[k:k+2]) for k in range(0, len(toks), 2)]
+    main_referees = pairs[:2]
+    linesmen = pairs[2:4] if len(pairs) >= 4 else []
+except StopIteration:
+    pass
 
-# 5) Вратари: ищем строки «В», следующая — ФИО, дальше (если есть) «С/Р»
-goalies_all = []
-i = 0
-while i < n:
-    if lines[i].strip() == "В":
-        name = lines[i+1].strip() if i+1 < n else ""
-        status = ""
-        if i+2 < n and lines[i+2].strip() in ("С","Р"):
-            status = {"С":"starter", "Р":"reserve"}[lines[i+2].strip()]
-            i += 3
-        else:
-            i += 2
-        goalies_all.append({"idx": i, "name": name, "status": status})
-    else:
-        i += 1
+# 5) Вратари: три строки после заголовка "Вратари Вратари", слева и справа по колонке
+def parse_goalie_segment(seg: str):
+    s = seg
+    m_stat = re.search(r"\b([СР])\s?(\d{2}\.\d{2}\.\d{4})", s)
+    status = {"С":"starter","Р":"reserve"}.get(m_stat.group(1), "") if m_stat else ""
+    m_name = re.search(r"\bВ\s+([A-Za-zА-Яа-яЁё.\- ]+?)\s+[СР]?\s?\d{0,2}\.?\d{0,2}\.?\d{4}", s)
+    name = m_name.group(1).strip() if m_name else ""
+    name = re.sub(r"\b[А-ЯЁ]\.\s*$", "", name).strip()
+    return {"name": name, "gk_status": status}
 
-# делим пополам (в PDF две колонки): первая половина — «home», вторая — «away»
-half = len(goalies_all)//2
-goal_home = [{"name": g["name"], "gk_status": g["status"]} for g in goalies_all[:half]]
-goal_away = [{"name": g["name"], "gk_status": g["status"]} for g in goalies_all[half:]]
+goal_home, goal_away = [], []
+try:
+    i_g = next(i for i,l in enumerate(lines) if re.fullmatch(r"Вратари\s+Вратари", l))
+    for li in (i_g+1, i_g+2, i_g+3):
+        row = lines[li]
+        # левая часть до правой колонки (начало правой — " NN В ")
+        m = re.search(r"(\d+\s+В\s+.*?)(?=\s+\d+\s+В\s+)", row)
+        if not m:
+            continue
+        left = m.group(1)
+        right = row[m.end():]
+        goal_home.append(parse_goalie_segment(left))
+        goal_away.append(parse_goalie_segment(right))
+except Exception:
+    pass
 
 out = {
   "ok": True,
@@ -122,10 +134,7 @@ out = {
     "time_msk": time_msk,
     "main_referees": main_referees,
     "linesmen": linesmen,
-    "goalies": {
-      "home": goal_home,
-      "away": goal_away
-    }
+    "goalies": { "home": goal_home, "away": goal_away }
   }
 }
 
@@ -133,6 +142,7 @@ p = pathlib.Path(OUT_DIR) / f"{UID}.json"
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 print("Wrote", p)
+
 
           PY
 
